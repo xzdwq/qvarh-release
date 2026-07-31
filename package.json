@@ -1,0 +1,186 @@
+{
+  "name": "qvarh-release",
+  "displayName": "Qvarh Release Builder",
+  "description": "Визуальная сборка релизных веток из локальных git-веток: хронология коммитов, обнаружение зависимостей и cherry-pick",
+  "version": "0.18.1",
+  "publisher": "xzdwq",
+  "author": "xzdwq",
+  "private": true,
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "SCM Providers"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "qvarhRelease",
+          "title": "Qvarh Release",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "qvarhRelease": [
+        {
+          "type": "webview",
+          "id": "qvarhRelease.settingsView",
+          "name": "Настройки и сборка релиза"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "qvarhRelease.startRelease",
+        "title": "Qvarh Release: собрать релизную ветку",
+        "category": "Qvarh Release",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "qvarhRelease.continueRelease",
+        "title": "Qvarh Release: продолжить сборку релиза",
+        "category": "Qvarh Release"
+      }
+    ],
+    "configuration": {
+      "title": "Qvarh Release Builder",
+      "properties": {
+        "qvarhRelease.git.mainBranch": {
+          "type": "string",
+          "default": "main",
+          "description": "Имя основной ветки, от которой создаётся релизная ветка"
+        },
+        "qvarhRelease.git.devBranch": {
+          "type": "string",
+          "default": "dev",
+          "description": "Ветка, от которой создаются feature/fix-ветки (dev/develop). Используется как база для вычисления коммитов, уникальных для ветки — если использовать основную ветку, при большом расхождении main и dev в список попадёт вся история dev. Если веток от dev не создают, укажите то же значение, что и в основной ветке"
+        },
+        "qvarhRelease.git.releaseBranchPattern": {
+          "type": "string",
+          "default": "release/release-{date}",
+          "description": "Шаблон имени релизной ветки. {date} заменяется на дату в формате YYYY-MM-DD"
+        },
+        "qvarhRelease.git.remoteName": {
+          "type": "string",
+          "default": "origin",
+          "description": "Имя git remote, из которого читаются ветки (origin/feature/PROJ-1234)"
+        },
+        "qvarhRelease.git.repositoryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Путь к локальному git-репозиторию. Если пусто, используется корень открытого workspace"
+        },
+        "qvarhRelease.git.branchListLimit": {
+          "type": "number",
+          "default": 100,
+          "minimum": 1,
+          "description": "Сколько веток показывать в списке по умолчанию (самые свежие по дате последнего коммита). При поиске по фильтру ограничение снимается в пределах того же количества совпадений — увеличьте значение, если веток в репозитории очень много и нужный фильтр не находится"
+        },
+        "qvarhRelease.git.nonTaskBranchPrefixes": {
+          "type": "string",
+          "default": "qa, revert-pr-, chore/",
+          "description": "Префиксы имён служебных веток через запятую — не задачи, исключаются из поиска возможных зависимостей (наравне с основной/dev-веткой и релизными ветками). Точное (не префиксное) совпадение имени, реально существующее в репозитории (обычно это \"qa\"), используется ещё и как дополнительная опорная ветка при поиске собственных коммитов — некоторые служебные ветки (например, revert-pr-*) заводятся не от dev, а от неё"
+        },
+        "qvarhRelease.git.hideDuplicateRemoteBranches": {
+          "type": "boolean",
+          "default": true,
+          "description": "Скрывать remote-tracking ветку из списка, если для неё есть локальная пара с тем же именем (иначе почти все ветки показываются в списке дважды подряд)"
+        },
+        "qvarhRelease.links.taskTrackerBaseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Базовый URL задачи в таск-трекере без ключа задачи — ключ (напр. PROJ-123) добавляется через \"/\". Подходит для Jira (https://your-company.atlassian.net/browse) и любого другого трекера с таким же принципом адресации. Оставьте пустым, чтобы не показывать ссылки на задачи"
+        },
+        "qvarhRelease.links.bitbucketWorkspace": {
+          "type": "string",
+          "default": "",
+          "description": "Workspace (организация) в Bitbucket — часть URL перед именем репозитория"
+        },
+        "qvarhRelease.links.bitbucketRepoSlug": {
+          "type": "string",
+          "default": "",
+          "description": "Имя репозитория в Bitbucket. Если пусто, используется имя папки репозитория"
+        },
+        "qvarhRelease.projects": {
+          "type": "array",
+          "default": [],
+          "description": "Сохранённые профили проектов — полный набор настроек на каждый репозиторий (см. панель \"Проекты\" в боковой панели), чтобы держать конфиг сразу нескольких репозиториев и сразу собирать релиз для любого из них, не переключая открытый workspace.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "repositoryPath": {
+                "type": "string"
+              },
+              "mainBranch": {
+                "type": "string"
+              },
+              "devBranch": {
+                "type": "string"
+              },
+              "remoteName": {
+                "type": "string"
+              },
+              "releaseBranchPattern": {
+                "type": "string"
+              },
+              "branchListLimit": {
+                "type": "number"
+              },
+              "nonTaskBranchPrefixes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "hideDuplicateRemoteBranches": {
+                "type": "boolean"
+              },
+              "taskTrackerBaseUrl": {
+                "type": "string"
+              },
+              "bitbucketWorkspace": {
+                "type": "string"
+              },
+              "bitbucketRepoSlug": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "node esbuild.js --production && vsce package",
+    "vscode:prepublish": "node esbuild.js --production"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "2.22.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "simple-git": "^3.24.0"
+  },
+  "overrides": {
+    "@vscode/vsce": {
+      "cheerio": "1.0.0-rc.12"
+    }
+  }
+}
