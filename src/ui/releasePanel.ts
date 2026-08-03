@@ -28,24 +28,51 @@ export interface ReleasePanelHost {
   onAbortBuild(): Promise<void>;
 }
 
+/** Что показывает панель прямо сейчас — какой сохранённый профиль проекта (id) или "текущий workspace" (undefined). Используется, чтобы понять, действительно ли произошло ПЕРЕКЛЮЧЕНИЕ, а не повторный вызов для того же самого контекста. */
+export interface PanelContext {
+  projectId?: string;
+  projectName?: string;
+}
+
 export class ReleasePanel {
   public static current: ReleasePanel | undefined;
 
   private readonly panel: vscode.WebviewPanel;
   private disposables: vscode.Disposable[] = [];
+  /** id профиля проекта, который панель показывает прямо сейчас; undefined — "текущий workspace" (без профиля). См. createOrShow. */
+  private currentProjectId: string | undefined;
 
-  static createOrShow(extensionUri: vscode.Uri, host: ReleasePanelHost): ReleasePanel {
+  private static titleFor(context?: PanelContext): string {
+    return context?.projectName ? `Qvarh Release Builder — ${context.projectName}` : 'Qvarh Release Builder';
+  }
+
+  static createOrShow(extensionUri: vscode.Uri, host: ReleasePanelHost, context?: PanelContext): ReleasePanel {
+    const title = ReleasePanel.titleFor(context);
     if (ReleasePanel.current) {
+      // Панель переиспользуется (её HTML/скрипт не перезагружаются) — если это ДРУГОЙ проект (или
+      // переключение между проектом и текущим workspace), список веток/хронология/команда
+      // cherry-pick на клиенте всё ещё принадлежат СТАРОМУ контексту и должны быть явно очищены
+      // ПЕРЕД тем, как для нового контекста придут свои данные — иначе они на секунду-другую (или
+      // навсегда, если пользователь не выберет ветки заново) выглядели бы как актуальные для нового
+      // проекта. Повторный вызов для ТОГО ЖЕ проекта (например, случайно нажали 🚀 второй раз) —
+      // не переключение, ничего не сбрасываем, чтобы не терять уже построенную хронологию.
+      const switched = ReleasePanel.current.currentProjectId !== context?.projectId;
       ReleasePanel.current.panel.reveal();
+      ReleasePanel.current.panel.title = title;
       ReleasePanel.current.host = host;
+      ReleasePanel.current.currentProjectId = context?.projectId;
+      if (switched) {
+        ReleasePanel.current.panel.webview.postMessage({ command: 'resetForNewContext' });
+      }
       return ReleasePanel.current;
     }
-    const panel = vscode.window.createWebviewPanel('qvarhRelease', 'Qvarh Release Builder', vscode.ViewColumn.One, {
+    const panel = vscode.window.createWebviewPanel('qvarhRelease', title, vscode.ViewColumn.One, {
       enableScripts: true,
       retainContextWhenHidden: true,
       localResourceRoots: [extensionUri],
     });
     ReleasePanel.current = new ReleasePanel(panel, host, extensionUri);
+    ReleasePanel.current.currentProjectId = context?.projectId;
     return ReleasePanel.current;
   }
 
@@ -1266,7 +1293,24 @@ export class ReleasePanel {
 
   window.addEventListener('message', (event) => {
     const msg = event.data;
-    if (msg.command === 'currentBranch') {
+    if (msg.command === 'resetForNewContext') {
+      // Панель переключилась на другой проект (или на "текущий workspace") — см. ReleasePanel.createOrShow.
+      // Сама панель (её HTML/скрипт) не перезагружается при переключении, поэтому список веток,
+      // хронология и команда cherry-pick с ПРЕЖНЕГО проекта иначе остались бы висеть на экране,
+      // пока не пришли бы данные нового — выглядело бы так, будто это уже ветки нового проекта.
+      currentBranches = [];
+      selectedRefs = new Set();
+      selectionInitialized = false;
+      limitInitialized = false;
+      currentPlan = null;
+      showError('');
+      document.getElementById('branchList').innerHTML = '<div class="muted branch-list-loading">Загрузка веток…</div>';
+      document.getElementById('branchListInfo').textContent = 'Загрузка списка веток…';
+      document.getElementById('staleBranches').innerHTML = '';
+      copiedCherryCmdKeys.clear();
+      renderItems();
+      updateBuildButtonsState();
+    } else if (msg.command === 'currentBranch') {
       document.getElementById('currentBranchName').textContent = msg.current;
       document.getElementById('mainBranchName').textContent = msg.mainBranch;
       configMainBranch = msg.mainBranch;

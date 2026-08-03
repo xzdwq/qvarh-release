@@ -26,7 +26,7 @@ import {
 } from './core/planner';
 import { BranchRef, MergeEventInfo, PlanItem, ReleaseConfig, ReleasePlan } from './core/types';
 import { GitService, MergeEventDetails, mainSubjectDateKey } from './git/gitService';
-import { ReleasePanel, ReleasePanelHost } from './ui/releasePanel';
+import { PanelContext, ReleasePanel, ReleasePanelHost } from './ui/releasePanel';
 
 const STATE_KEY = 'qvarhRelease.session.v3';
 
@@ -600,8 +600,8 @@ export class ReleaseSession implements ReleasePanelHost {
    * не завершатся, из-за чего "Собрать релизную ветку" ощутимо не сразу реагировала на клик.
    * Список веток теперь приходит в уже открытую панель отдельным сообщением, как только будет готов.
    */
-  async start(extensionUri: vscode.Uri, overrideConfig?: ReleaseConfig): Promise<void> {
-    this.panel = ReleasePanel.createOrShow(extensionUri, this);
+  async start(extensionUri: vscode.Uri, overrideConfig?: ReleaseConfig, projectContext?: PanelContext): Promise<void> {
+    this.panel = ReleasePanel.createOrShow(extensionUri, this, projectContext);
     try {
       await this.ensureClients(overrideConfig);
       this.ready = true;

@@ -34,7 +34,7 @@ export function activate(context: vscode.ExtensionContext): void {
           throw new Error(`Профиль проекта не найден (id=${projectId}) — возможно, он был удалён или изменён в другом окне.`);
         }
         const session = new ReleaseSession(context);
-        await session.start(context.extensionUri, project);
+        await session.start(context.extensionUri, project, { projectId: project.id, projectName: project.name });
       } catch (err: any) {
         vscode.window.showErrorMessage(`Qvarh Release: ${err?.message ?? err}`);
       }

@@ -2,7 +2,7 @@
   "name": "qvarh-release",
   "displayName": "Qvarh Release Builder",
   "description": "Визуальная сборка релизных веток из локальных git-веток: хронология коммитов, обнаружение зависимостей и cherry-pick",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "publisher": "xzdwq",
   "author": "xzdwq",
   "private": true,
