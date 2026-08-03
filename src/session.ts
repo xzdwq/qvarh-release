@@ -449,7 +449,7 @@ export class ReleaseSession implements ReleasePanelHost {
 
   private async postCurrentBranch(): Promise<void> {
     const current = await this.git.currentBranch();
-    this.panel.postCurrentBranch(current, this.config.mainBranch);
+    this.panel.postCurrentBranch(current, this.config.mainBranch, this.config.devBranch);
   }
 
   private selectedBranchRefs(): BranchRef[] {

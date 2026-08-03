@@ -114,8 +114,8 @@ export class ReleasePanel {
     );
   }
 
-  postCurrentBranch(current: string, mainBranch: string): void {
-    this.panel.webview.postMessage({ command: 'currentBranch', current, mainBranch });
+  postCurrentBranch(current: string, mainBranch: string, devBranch: string): void {
+    this.panel.webview.postMessage({ command: 'currentBranch', current, mainBranch, devBranch });
   }
 
   postBranches(branches: BranchRef[], selectedRefs: string[], info: BranchListInfo): void {
@@ -251,8 +251,15 @@ export class ReleasePanel {
      присутствовать в DOM ради Y-координаты для кривой слияния на дорожке. */
   .timeline-row.timeline-row-hidden { min-height: 0; border-bottom: none; }
   .rail-overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
-  .rail-overlay .rail-line { stroke-width: 2; fill: none; }
+  .rail-overlay .rail-line { stroke-width: 2; fill: none; transition: opacity 0.1s ease, stroke-width 0.1s ease; }
   .rail-overlay .rail-halo { fill: var(--vscode-editor-background, var(--vscode-sideBar-background)); }
+  /* Наведение на точку коммита (см. wireRailHover) — тускнеет всё, кроме дорожки/точек этой же
+     ветки, а её саму делает чуть заметнее (толще линия). Точки с data-branch — единственное, что
+     реально ловит события мыши: остальная часть .rail-overlay остаётся pointer-events:none. */
+  .rail-overlay circle[data-branch] { pointer-events: auto; cursor: pointer; transition: opacity 0.1s ease; }
+  .rail-overlay [data-branch].rail-dim { opacity: 0.2; }
+  .rail-overlay [data-branch].rail-hot { opacity: 1; }
+  .rail-overlay .rail-line.rail-hot { stroke-width: 3.5; }
   .stale-branches { margin-top: 8px; }
   .stale-branch-row { font-size: 11px; padding: 3px 0; border-bottom: 1px dashed var(--vscode-panel-border); }
   .cherry-pick-section { margin-top: 10px; }
@@ -293,7 +300,7 @@ export class ReleasePanel {
     </div>
     <div class="pull-row">
       <label>Pull ветку:</label>
-      <input type="text" id="pullBranchInput" list="branchNamesList" placeholder="main или dev/имя" />
+      <input type="text" id="pullBranchInput" list="branchNamesList" placeholder="имя основной или dev-ветки" />
       <datalist id="branchNamesList"></datalist>
       <button id="pullBtn" class="secondary">Pull (checkout + pull)</button>
     </div>
@@ -306,7 +313,7 @@ export class ReleasePanel {
       <input type="text" id="branchFilter" placeholder="PROJ-123 PROJ-456" />
     </div>
     <div class="filter-row">
-      <label title="Применяется вместе с лимитом показа по кнопке «Применить» — скрытие происходит ДО среза по лимиту"><input type="checkbox" id="hideInMainFilter" /> Скрыть в main</label>
+      <label title="Применяется вместе с лимитом показа по кнопке «Применить» — скрытие происходит ДО среза по лимиту"><input type="checkbox" id="hideInMainFilter" /> Скрыть в <span id="hideInMainFilterBranchName">main</span></label>
       <label title="Скрыть qa, revert-pr-, chore/ и т.п. — см. настройку «Префиксы служебных веток». Применяется сразу"><input type="checkbox" id="hideServiceBranchesFilter" /> Скрыть служебные</label>
       <label>Показывать: <input type="text" id="branchListLimitInput" inputmode="numeric" pattern="[0-9]*" /></label>
       <button id="branchListLimitBtn" class="secondary" title="Применяет флажок «Скрыть в main» и лимит показа вместе">Применить</button>
@@ -373,6 +380,12 @@ export class ReleasePanel {
 
 <script>
   const vscode = acquireVsCodeApi();
+  // Настоящие имена основной/dev-ветки из конфига (см. session.ts postCurrentBranch) — везде, где
+  // раньше было жёстко зашито "main"/"dev" в тексте бейджей/подсказок, используем эти переменные,
+  // чтобы текст совпадал с реальными настройками проекта, а не всегда говорил буквально "main".
+  // Разумные значения по умолчанию — на случай, если что-то отрендерится до первого сообщения currentBranch.
+  let configMainBranch = 'main';
+  let configDevBranch = 'dev';
   let currentBranches = [];
   let selectedRefs = new Set();
   let selectionInitialized = false;
@@ -408,8 +421,8 @@ export class ReleasePanel {
   }
 
   function mainStatusBadge(status) {
-    if (status === 'full') return '<span class="badge inmain">уже в main</span>';
-    if (status === 'partial') return '<span class="badge partial-inmain">частично в main</span>';
+    if (status === 'full') return \`<span class="badge inmain">уже в \${configMainBranch}</span>\`;
+    if (status === 'partial') return \`<span class="badge partial-inmain">частично в \${configMainBranch}</span>\`;
     return '';
   }
 
@@ -481,14 +494,14 @@ export class ReleasePanel {
     if (!entry) return '';
     const { commits, truncated, forkedFrom } = entry;
     const forkedFromNote = forkedFrom
-      ? \`<div class="branch-commits muted">Ветка заведена не от dev, а от <b>\${escapeHtml(forkedFrom)}</b> — коммиты показаны относительно неё</div>\`
+      ? \`<div class="branch-commits muted">Ветка заведена не от \${configDevBranch}, а от <b>\${escapeHtml(forkedFrom)}</b> — коммиты показаны относительно неё</div>\`
       : '';
-    if (commits.length === 0) return forkedFromNote + '<div class="branch-commits muted">Нет коммитов, отсутствующих в dev-ветке (см. настройку Dev-ветка)</div>';
+    if (commits.length === 0) return forkedFromNote + \`<div class="branch-commits muted">Нет коммитов, отсутствующих в \${configDevBranch}-ветке (см. настройку Dev-ветка)</div>\`;
     const truncatedNote = truncated
-      ? '<div class="branch-commits muted">Показаны не все коммиты (их слишком много) — возможно, dev-ветка сильно отстала или указана неверно в настройках</div>'
+      ? \`<div class="branch-commits muted">Показаны не все коммиты (их слишком много) — возможно, \${configDevBranch}-ветка сильно отстала или указана неверно в настройках</div>\`
       : '';
     return forkedFromNote + '<div class="branch-commits">' + commits.map((c) => \`
-      <div class="branch-commit-row"><span class="sha">\${c.sha.slice(0,8)}</span> · \${formatDate(c.authorDate)} · \${c.authorName} · \${c.subject} \${c.alreadyInMain ? '<span class="badge inmain">уже в main</span>' : ''} \${renderLinks(c)}</div>
+      <div class="branch-commit-row"><span class="sha">\${c.sha.slice(0,8)}</span> · \${formatDate(c.authorDate)} · \${c.authorName} · \${c.subject} \${c.alreadyInMain ? \`<span class="badge inmain">уже в \${configMainBranch}</span>\` : ''} \${renderLinks(c)}</div>
     \`).join('') + truncatedNote + '</div>';
   }
 
@@ -508,13 +521,13 @@ export class ReleasePanel {
             <div><span class="branch-name">\${b.name}</span> \${mainStatusBadge(status)}</div>
             <div class="muted sha">\${b.lastCommitSha ? b.lastCommitSha.slice(0,8) : ''} · \${formatDate(b.lastCommitDate)} · \${b.lastCommitAuthor} · \${b.lastCommitSubject}</div>
             \${renderLinks(b)}
-            <button class="link expand-toggle" data-ref="\${b.ref}">\${expanded ? '▾ скрыть коммиты' : '▸ показать коммиты (относительно dev-ветки)'}</button>
+            <button class="link expand-toggle" data-ref="\${b.ref}">\${expanded ? '▾ скрыть коммиты' : \`▸ показать коммиты (относительно \${configDevBranch}-ветки)\`}</button>
             \${expanded ? renderBranchCommits(b.ref) : ''}
           </div>
         </div>
       </div>
     \`;
-    }).join('') || '<div class="muted">Ничего не найдено (проверьте фильтр или флажок "Скрыть уже в main")</div>';
+    }).join('') || \`<div class="muted">Ничего не найдено (проверьте фильтр или флажок "Скрыть уже в \${configMainBranch}")</div>\`;
 
     [...el.querySelectorAll('.branch-check')].forEach((cb) => {
       cb.addEventListener('change', (e) => {
@@ -722,7 +735,7 @@ export class ReleasePanel {
 
     let hint = '';
     if (item.alreadyInMain) {
-      hint = '<div class="conflict-hint">Похоже, эта задача уже выпущена в main (см. бейдж «уже в main») — возможно, проще просто исключить её из релиза (снять галочку), а не разрешать конфликт.</div>';
+      hint = \`<div class="conflict-hint">Похоже, эта задача уже выпущена в \${configMainBranch} (см. бейдж «уже в \${configMainBranch}») — возможно, проще просто исключить её из релиза (снять галочку), а не разрешать конфликт.</div>\`;
     } else {
       const allCauses = sources.flatMap((s) => (s.possibleCauses || []).map((c) => ({ ...c, file: s.file })));
       if (allCauses.length > 0) {
@@ -758,7 +771,7 @@ export class ReleasePanel {
       const label = branches.length ? branches.join(', ') : \`\${item.overlapsWith.length} коммит(ами) на других ветках\`;
       overlapBadge = \`<span class="badge overlap">пересекается с: \${label}</span>\`;
     }
-    const inMainBadge = item.alreadyInMain ? '<span class="badge inmain">уже в main</span>' : '';
+    const inMainBadge = item.alreadyInMain ? \`<span class="badge inmain">уже в \${configMainBranch}</span>\` : '';
     return \`
       <div class="item-row">
         <input type="checkbox" class="item-check" data-sha="\${item.sha}" \${item.included ? 'checked' : ''} \${item.applied ? 'disabled' : ''} />
@@ -777,7 +790,7 @@ export class ReleasePanel {
   function renderContextRow(commit) {
     return \`
       <div class="context-row">
-        <span class="lane-label">dev</span>
+        <span class="lane-label">\${configDevBranch}</span>
         <div class="item-main">
           <div>\${commit.subject}</div>
           <div class="sha">\${commit.sha.slice(0,8)} · \${commit.authorName} · \${formatDate(commit.authorDate)}</div>
@@ -793,9 +806,9 @@ export class ReleasePanel {
   function renderAnchorRow(commit) {
     return \`
       <div class="context-row">
-        <span class="lane-label">dev</span>
+        <span class="lane-label">\${configDevBranch}</span>
         <div class="item-main">
-          <div>\${commit.subject} <span class="muted">— последний коммит dev перед началом хронологии</span></div>
+          <div>\${commit.subject} <span class="muted">— последний коммит \${configDevBranch} перед началом хронологии</span></div>
           <div class="sha">\${commit.sha.slice(0,8)} · \${commit.authorName} · \${formatDate(commit.authorDate)}</div>
           \${renderLinks(commit)}
         </div>
@@ -889,10 +902,38 @@ export class ReleasePanel {
     return \`M \${x0},\${y0} C \${x0},\${ymid} \${x1},\${ymid} \${x1},\${y1}\`;
   }
 
-  function railDot(x, y, color) {
+  function railDot(x, y, color, branch) {
     // Второй, более крупный круг цвета фона — "проталина" вокруг точки, чтобы пересекающие линии
     // других веток не проходили ПРЯМО СКВОЗЬ неё (аналог прежнего box-shadow-кольца на CSS-варианте).
-    return \`<circle cx="\${x}" cy="\${y}" r="\${RAIL_DOT_R + 2}" class="rail-halo" /><circle cx="\${x}" cy="\${y}" r="\${RAIL_DOT_R}" fill="\${color}" />\`;
+    // data-branch — только когда точка реально принадлежит (или отмечает слияние) конкретной ветке;
+    // используется наведением мыши, чтобы подсветить всю ветку целиком (см. wireRailHover).
+    const dataAttr = branch ? \` data-branch="\${branch}"\` : '';
+    return \`<circle cx="\${x}" cy="\${y}" r="\${RAIL_DOT_R + 2}" class="rail-halo"\${dataAttr} /><circle cx="\${x}" cy="\${y}" r="\${RAIL_DOT_R}" fill="\${color}"\${dataAttr} />\`;
+  }
+
+  // Наведение мыши на любую точку коммита/слияния с data-branch подсвечивает ВСЮ дорожку этой ветки
+  // (её линию/кривые целиком + все её точки, включая точки слияния на стволе), а не только саму
+  // точку под курсором — остальные ветки тускнеют, ствол остаётся как есть. Вызывается заново после
+  // каждой перерисовки .rail-overlay (innerHTML полностью заменяется, поэтому старые слушатели уже
+  // не существуют — переподписываться нужно каждый раз).
+  function wireRailHover(railOverlay) {
+    const svg = railOverlay.querySelector('svg');
+    if (!svg) return;
+    const tagged = [...svg.querySelectorAll('[data-branch]')];
+    const dots = svg.querySelectorAll('circle[data-branch]');
+    dots.forEach((dot) => {
+      dot.addEventListener('mouseenter', () => {
+        const branch = dot.dataset.branch;
+        tagged.forEach((el) => {
+          const match = el.dataset.branch === branch;
+          el.classList.toggle('rail-hot', match);
+          el.classList.toggle('rail-dim', !match);
+        });
+      });
+      dot.addEventListener('mouseleave', () => {
+        tagged.forEach((el) => el.classList.remove('rail-hot', 'rail-dim'));
+      });
+    });
   }
 
   // Рисует один SVG-оверлей на всю показанную хронологию сразу (а не по ячейке на строку), беря
@@ -912,16 +953,18 @@ export class ReleasePanel {
     merged.forEach((row, idx) => {
       if (row.kind === 'item') return;
       let color = trunkColor;
+      let mergeBranch = null;
       for (const [branch, range] of rail.ranges) {
         // Финальное (закрывающее лейн) слияние — как и раньше; плюс любое более раннее слияние ЭТОЙ
         // ЖЕ ветки (см. intermediateMergeRows в computeRail — ветка, которую мержили несколько раз за
         // её жизнь) тоже отмечается точкой на стволе, просто не закрывает дорожку.
         if (range.mergedAtRow === idx || range.intermediateMergeRows.includes(idx)) {
           color = colorFor(branch);
+          mergeBranch = branch;
           break;
         }
       }
-      dots.push(railDot(trunkX, rowCenters[idx], color));
+      dots.push(railDot(trunkX, rowCenters[idx], color, mergeBranch));
     });
 
     for (const [branch, lane] of [...rail.laneOf.entries()].sort((a, b) => a[1] - b[1])) {
@@ -938,11 +981,11 @@ export class ReleasePanel {
       // симметрично нижнему "хвосту" у невлитых веток дорожка обрывается пунктиром за ВЕРХНИЙ край —
       // сигнал "ветвление было раньше показанного окна", а не оборванная на середине линия.
       if (range.start > 0) {
-        lines.push(\`<path d="\${laneCurve(trunkX, rowCenters[range.start - 1], x, rowCenters[range.start])}" stroke="\${color}" class="rail-line" />\`);
+        lines.push(\`<path d="\${laneCurve(trunkX, rowCenters[range.start - 1], x, rowCenters[range.start])}" stroke="\${color}" class="rail-line" data-branch="\${branch}" />\`);
       } else {
         // Небольшой выступ (плюс отступ #items сверху — см. CSS) — раньше заезжал на строку с
         // кнопкой "показать/скрыть контекстные коммиты dev", расположенную прямо над списком.
-        lines.push(\`<path d="M \${x},-2 L \${x},\${rowCenters[range.start]}" stroke="\${color}" stroke-dasharray="3 3" class="rail-line" />\`);
+        lines.push(\`<path d="M \${x},-2 L \${x},\${rowCenters[range.start]}" stroke="\${color}" stroke-dasharray="3 3" class="rail-line" data-branch="\${branch}" />\`);
       }
       // Между стартом и финальным слиянием дорожка идёт прямой линией на СВОЕЙ дорожке, но на каждом
       // промежуточном слиянии (см. intermediateMergeRows в computeRail — ветку мержили больше одного
@@ -952,28 +995,28 @@ export class ReleasePanel {
       for (const mergeIdx of range.intermediateMergeRows) {
         const outFrom = Math.max(cursor, mergeIdx - 1);
         if (outFrom > cursor) {
-          lines.push(\`<path d="M \${x},\${rowCenters[cursor]} L \${x},\${rowCenters[outFrom]}" stroke="\${color}" class="rail-line" />\`);
+          lines.push(\`<path d="M \${x},\${rowCenters[cursor]} L \${x},\${rowCenters[outFrom]}" stroke="\${color}" class="rail-line" data-branch="\${branch}" />\`);
         }
-        lines.push(\`<path d="\${laneCurve(x, rowCenters[outFrom], trunkX, rowCenters[mergeIdx])}" stroke="\${color}" class="rail-line" />\`);
+        lines.push(\`<path d="\${laneCurve(x, rowCenters[outFrom], trunkX, rowCenters[mergeIdx])}" stroke="\${color}" class="rail-line" data-branch="\${branch}" />\`);
         const backTo = Math.min(mergeIdx + 1, vertEndIdx);
-        lines.push(\`<path d="\${laneCurve(trunkX, rowCenters[mergeIdx], x, rowCenters[backTo])}" stroke="\${color}" class="rail-line" />\`);
+        lines.push(\`<path d="\${laneCurve(trunkX, rowCenters[mergeIdx], x, rowCenters[backTo])}" stroke="\${color}" class="rail-line" data-branch="\${branch}" />\`);
         cursor = backTo;
       }
       if (vertEndIdx > cursor) {
-        lines.push(\`<path d="M \${x},\${rowCenters[cursor]} L \${x},\${rowCenters[vertEndIdx]}" stroke="\${color}" class="rail-line" />\`);
+        lines.push(\`<path d="M \${x},\${rowCenters[cursor]} L \${x},\${rowCenters[vertEndIdx]}" stroke="\${color}" class="rail-line" data-branch="\${branch}" />\`);
       }
       if (isMerged) {
-        lines.push(\`<path d="\${laneCurve(x, rowCenters[vertEndIdx], trunkX, rowCenters[range.mergedAtRow])}" stroke="\${color}" class="rail-line" />\`);
+        lines.push(\`<path d="\${laneCurve(x, rowCenters[vertEndIdx], trunkX, rowCenters[range.mergedAtRow])}" stroke="\${color}" class="rail-line" data-branch="\${branch}" />\`);
       } else {
         // Ветка ещё не влита — дорожка обрывается пунктирным "хвостом" ЗА нижний край видимой
         // хронологии, а не точкой в никуда: сигнал "продолжение есть, но оно вне показанного окна",
         // а не оборванная на середине строки линия.
-        lines.push(\`<path d="M \${x},\${lastY} L \${x},\${containerHeight + 4}" stroke="\${color}" stroke-dasharray="3 3" class="rail-line" />\`);
+        lines.push(\`<path d="M \${x},\${lastY} L \${x},\${containerHeight + 4}" stroke="\${color}" stroke-dasharray="3 3" class="rail-line" data-branch="\${branch}" />\`);
       }
 
       merged.forEach((row, idx) => {
         if (row.kind === 'item' && row.item.branch === branch) {
-          dots.push(railDot(x, rowCenters[idx], color));
+          dots.push(railDot(x, rowCenters[idx], color, branch));
         }
       });
     }
@@ -986,9 +1029,17 @@ export class ReleasePanel {
   // успеет вызваться СНОВА (например, пользователь быстро свернул/развернул контекстные коммиты),
   // устаревший (уже неактуальный) отложенный проход измерения не должен перерисовать поверх нового.
   let railRenderGeneration = 0;
+  // Единственный ResizeObserver дорожки — разъединяем предыдущий на каждый renderItems(), иначе при
+  // повторных вызовах (сворачивание контекстных коммитов, применение плана и т.п.) их накопилось бы
+  // несколько одновременно, каждый перерисовывающий поверх остальных.
+  let railResizeObserver = null;
 
   function renderItems() {
     const myGeneration = ++railRenderGeneration;
+    if (railResizeObserver) {
+      railResizeObserver.disconnect();
+      railResizeObserver = null;
+    }
     const el = document.getElementById('items');
     const toggleBtn = document.getElementById('toggleContextBtn');
     if (!currentPlan || currentPlan.items.length === 0) {
@@ -1005,8 +1056,8 @@ export class ReleasePanel {
     if (contextCommits.length > 0 || anchorCommit) {
       toggleBtn.style.display = 'inline-block';
       toggleBtn.textContent = contextCollapsed
-        ? \`▸ показать контекстные коммиты dev (\${contextCommits.length}\${currentPlan.contextCommitsTruncated ? '+' : ''})\`
-        : '▾ скрыть контекстные коммиты dev';
+        ? \`▸ показать контекстные коммиты \${configDevBranch} (\${contextCommits.length}\${currentPlan.contextCommitsTruncated ? '+' : ''})\`
+        : \`▾ скрыть контекстные коммиты \${configDevBranch}\`;
     } else {
       toggleBtn.style.display = 'none';
     }
@@ -1081,6 +1132,7 @@ export class ReleasePanel {
       // overflow:visible — иначе браузер по умолчанию обрезает root <svg> точно по width/height, а
       // пунктирные "хвосты" веток (см. drawRail) намеренно выходят за верхний/нижний край на пару пикселей.
       railOverlay.innerHTML = \`<svg width="\${railW}" height="\${containerHeight}" style="overflow:visible">\${drawRail(rail, merged, rowCenters, containerHeight)}</svg>\`;
+      wireRailHover(railOverlay);
     };
     drawRailNow();
     // Если нужный шрифт (moноширинный для sha/дат и т.п.) в момент первой отрисовки ещё не
@@ -1091,6 +1143,23 @@ export class ReleasePanel {
     // новой отрисовки, если renderItems() успели вызвать повторно, пока мы ждали шрифты.
     if (document.fonts && document.fonts.ready) {
       document.fonts.ready.then(drawRailNow);
+    }
+
+    // Ресайз панели (перетаскивание границы редактора, смена ширины окна VS Code и т.п.) меняет
+    // ширину #items, из-за чего тема коммита может перенестись на другое число строк — высоты строк
+    // меняются, а без пересчёта дорожка осталась бы нарисованной по старым, уже неверным координатам
+    // ("съезжает" относительно текста). requestAnimationFrame схлопывает частые срабатывания подряд
+    // (ResizeObserver может стрелять много раз за один плавный ресайз) в одну перерисовку за кадр.
+    if (typeof ResizeObserver !== 'undefined') {
+      let resizeFrame = null;
+      railResizeObserver = new ResizeObserver(() => {
+        if (resizeFrame !== null) return;
+        resizeFrame = requestAnimationFrame(() => {
+          resizeFrame = null;
+          drawRailNow();
+        });
+      });
+      railResizeObserver.observe(el);
     }
 
     [...el.querySelectorAll('.item-check')].forEach((cb) => {
@@ -1200,6 +1269,10 @@ export class ReleasePanel {
     if (msg.command === 'currentBranch') {
       document.getElementById('currentBranchName').textContent = msg.current;
       document.getElementById('mainBranchName').textContent = msg.mainBranch;
+      configMainBranch = msg.mainBranch;
+      configDevBranch = msg.devBranch;
+      document.getElementById('hideInMainFilterBranchName').textContent = configMainBranch;
+      document.getElementById('branchListLimitBtn').title = \`Применяет флажок «Скрыть в \${configMainBranch}» и лимит показа вместе\`;
       setPullBusy(false);
     } else if (msg.command === 'branches') {
       setBranchListLimitBusy(false);

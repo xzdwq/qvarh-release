@@ -116,6 +116,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     border: none; border-radius: 3px; padding: 6px 10px; cursor: pointer; margin-top: 4px;
   }
   button:hover { background: var(--vscode-button-hoverBackground); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button:disabled:hover { background: var(--vscode-button-background); }
   button.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
   button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
   button.danger { background: var(--vscode-inputValidation-errorBorder); color: #fff; }
@@ -217,12 +219,20 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
   }
 
+  function isProjectFormOpen() {
+    return document.getElementById('projectForm').style.display !== 'none';
+  }
+
   function renderProjectsList() {
     const el = document.getElementById('projectsList');
     if (projects.length === 0) {
       el.innerHTML = '<div class="hint">Проектов пока нет — добавьте первый ниже.</div>';
       return;
     }
+    // Пока открыта форма редактирования/добавления проекта, "🚀 Собрать релизную ветку" для ЛЮБОГО
+    // проекта заблокирована — иначе легко случайно запустить сборку со старыми настройками, пока
+    // редактируешь текущие и ещё не сохранил (или просто забыл, что форма всё ещё открыта).
+    const formOpen = isProjectFormOpen();
     el.innerHTML = projects.map((p) => {
       if (p.id === pendingDeleteId) {
         return \`
@@ -233,13 +243,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           </div>
         \`;
       }
+      const startTitle = formOpen ? 'Сначала закройте форму редактирования проекта' : 'Собрать релизную ветку для этого проекта';
       return \`
       <div class="project-row">
         <div class="project-row-info">
           <div class="project-row-name">\${escapeHtml(p.name)}</div>
           <div class="project-row-path">\${escapeHtml(p.repositoryPath)}</div>
         </div>
-        <button data-action="start" data-id="\${p.id}" title="Собрать релизную ветку для этого проекта">🚀</button>
+        <button data-action="start" data-id="\${p.id}" title="\${startTitle}" \${formOpen ? 'disabled' : ''}>🚀</button>
         <button class="secondary" data-action="edit" data-id="\${p.id}" title="Изменить">✎</button>
         <button class="secondary" data-action="delete" data-id="\${p.id}" title="Удалить">✕</button>
       </div>
@@ -255,6 +266,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         if (action === 'start') {
           vscode.postMessage({ command: 'startReleaseForProject', id });
         } else if (action === 'edit') {
+          // Повторный клик на "✎" уже редактируемого проекта закрывает форму — точно так же, как
+          // кнопка "Отмена", а не открывает её заново поверх самой себя.
+          if (editingProjectId === id && isProjectFormOpen()) {
+            hideProjectForm();
+            return;
+          }
           editingProjectId = id;
           document.getElementById('projectFormTitle').textContent = 'Изменить проект «' + project.name + '»';
           for (const f of PROJECT_FIELDS) {
@@ -266,6 +283,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             if (input) input.checked = project[f] !== false;
           }
           document.getElementById('projectForm').style.display = 'block';
+          renderProjectsList();
         } else if (action === 'delete') {
           pendingDeleteId = id;
           renderProjectsList();
@@ -292,11 +310,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const input = document.getElementById('proj_' + f);
       if (input) input.checked = true;
     }
+    renderProjectsList();
   }
 
   document.getElementById('projAddBtn').addEventListener('click', () => {
     hideProjectForm();
     document.getElementById('projectForm').style.display = 'block';
+    renderProjectsList();
   });
   document.getElementById('projCancelBtn').addEventListener('click', () => {
     hideProjectForm();
