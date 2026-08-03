@@ -26,6 +26,7 @@ export interface ReleasePanelHost {
   onContinueConflict(): Promise<void>;
   onSkipConflict(): Promise<void>;
   onAbortBuild(): Promise<void>;
+  onSetStaleBranchesLookback(n: number): Promise<void>;
 }
 
 /** Что показывает панель прямо сейчас — какой сохранённый профиль проекта (id) или "текущий workspace" (undefined). Используется, чтобы понять, действительно ли произошло ПЕРЕКЛЮЧЕНИЕ, а не повторный вызов для того же самого контекста. */
@@ -131,6 +132,9 @@ export class ReleasePanel {
             case 'abortBuild':
               await this.host.onAbortBuild();
               break;
+            case 'setStaleBranchesLookback':
+              await this.host.onSetStaleBranchesLookback(message.value);
+              break;
           }
         } catch (err: any) {
           this.postError(err?.message ?? String(err));
@@ -141,8 +145,8 @@ export class ReleasePanel {
     );
   }
 
-  postCurrentBranch(current: string, mainBranch: string, devBranch: string): void {
-    this.panel.webview.postMessage({ command: 'currentBranch', current, mainBranch, devBranch });
+  postCurrentBranch(current: string, mainBranch: string, devBranch: string, staleBranchesLookbackReleases: number): void {
+    this.panel.webview.postMessage({ command: 'currentBranch', current, mainBranch, devBranch, staleBranchesLookbackReleases });
   }
 
   postBranches(branches: BranchRef[], selectedRefs: string[], info: BranchListInfo): void {
@@ -212,6 +216,9 @@ export class ReleasePanel {
   button.link { background: none; color: var(--vscode-textLink-foreground); padding: 0; margin: 0; text-decoration: underline; font-size: 11px; }
   .links a { color: var(--vscode-textLink-foreground); text-decoration: none; margin-right: 8px; font-size: 11px; }
   .links a:hover { text-decoration: underline; }
+  .links .diffstat { font-size: 11px; font-family: var(--vscode-editor-font-family, monospace); }
+  .links .diffstat-add { color: var(--vscode-charts-green); }
+  .links .diffstat-del { color: var(--vscode-charts-red); margin-left: 4px; }
   button:disabled { opacity: 0.5; cursor: default; }
   #branchList { height: 280px; min-height: 120px; resize: vertical; overflow-y: auto; overflow-x: hidden; border: 1px solid var(--vscode-panel-border); padding: 4px; margin-top: 6px; }
   .branch-row { padding: 3px 0; border-bottom: 1px dashed var(--vscode-panel-border); }
@@ -289,6 +296,8 @@ export class ReleasePanel {
   .rail-overlay .rail-line.rail-hot { stroke-width: 3.5; }
   .stale-branches { margin-top: 8px; }
   .stale-branch-row { font-size: 11px; padding: 3px 0; border-bottom: 1px dashed var(--vscode-panel-border); }
+  .stale-branches-controls { margin-bottom: 4px; }
+  .stale-branches-controls input[type="number"] { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 2px; padding: 1px 4px; }
   .cherry-pick-section { margin-top: 10px; }
   .section-header-static { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
   .cherry-cmd { margin-bottom: 10px; padding: 6px 8px; border: 1px solid var(--vscode-panel-border); border-radius: 3px; }
@@ -365,8 +374,8 @@ export class ReleasePanel {
       <div class="button-row" style="margin-top:0;">
         <button id="toggleContextBtn" class="link" style="display:none;"></button>
       </div>
-      <div id="items"></div>
       <div id="staleBranches" class="stale-branches"></div>
+      <div id="items"></div>
       <div id="cherryPickSection" class="cherry-pick-section" style="display:none;">
         <div class="section-header-static">
           <h4 style="margin:0;">Команда для ручного cherry-pick</h4>
@@ -413,6 +422,8 @@ export class ReleasePanel {
   // Разумные значения по умолчанию — на случай, если что-то отрендерится до первого сообщения currentBranch.
   let configMainBranch = 'main';
   let configDevBranch = 'dev';
+  let staleBranchesLookbackReleases = 4;
+  let lastStaleHints = null;
   let currentBranches = [];
   let selectedRefs = new Set();
   let selectionInitialized = false;
@@ -457,11 +468,28 @@ export class ReleasePanel {
     return branchMainStatusOverride.get(ref) || fallback;
   }
 
+  // "+N"/"-M" числа изменённых строк (см. PlanItem.insertions/deletions) — в конце той же строки,
+  // где ссылки на задачу/PR/коммит, а не прямо на графе: там при узком лейне (18px) и мелком шрифте
+  // текст пришлось разворачивать вертикально в разные стороны для "+" и "-", и прочитать его было
+  // практически невозможно. У context/anchor-коммитов (CommitInfo, не PlanItem) этих полей нет —
+  // для них просто ничего не рендерится.
+  function renderDiffStatInline(entity) {
+    const insertions = entity.insertions || 0;
+    const deletions = entity.deletions || 0;
+    if (!insertions && !deletions) return '';
+    let out = '<span class="diffstat">';
+    if (insertions) out += \`<span class="diffstat-add">+\${formatDiffCount(insertions)}</span>\`;
+    if (deletions) out += \`<span class="diffstat-del">-\${formatDiffCount(deletions)}</span>\`;
+    return out + '</span>';
+  }
+
   function renderLinks(entity) {
     const links = [];
     if (entity.taskUrl) links.push(\`<a href="\${entity.taskUrl}" target="_blank" rel="noopener">Задача</a>\`);
     if (entity.prUrl) links.push(\`<a href="\${entity.prUrl}" target="_blank" rel="noopener">PR #\${entity.prNumber}</a>\`);
     if (entity.commitUrl) links.push(\`<a href="\${entity.commitUrl}" target="_blank" rel="noopener">коммит</a>\`);
+    const diffStat = renderDiffStatInline(entity);
+    if (diffStat) links.push(diffStat);
     return links.length ? \`<div class="links">\${links.join('')}</div>\` : '';
   }
 
@@ -507,7 +535,9 @@ export class ReleasePanel {
     }
     el.innerHTML = 'Выбрано: ' + [...selectedRefs].map((ref) => {
       const name = branchNameByRef.get(ref) || ref;
-      return \`<span class="chip">\${name} <button class="chip-remove" data-ref="\${ref}" title="Убрать из выбора">×</button></span>\`;
+      // Цвет чипа — тот же colorFor(name), что и у дорожки ветки на графе, чтобы выбор в списке и
+      // сама хронология были визуально связаны (см. .cherry-sha — тот же приём для sha в командах).
+      return \`<span class="chip" style="background:\${colorFor(name)};color:#000;">\${name} <button class="chip-remove" data-ref="\${ref}" title="Убрать из выбора">×</button></span>\`;
     }).join('');
 
     [...el.querySelectorAll('.chip-remove')].forEach((btn) => {
@@ -691,21 +721,54 @@ export class ReleasePanel {
     renderCherryPickCommands();
   });
 
-  function renderStaleBranchesLoading() {
-    document.getElementById('staleBranches').innerHTML = '<div class="muted inline-loading">Проверяем, нет ли более старых невлитых веток…</div>';
+  // Инпут N живёт прямо в этом блоке (а не в настройках) — меняется по ходу работы с хронологией,
+  // без похода в настройки, но НЕ пересчитывает уже показанный список сразу: значение учитывается
+  // только со следующего нажатия "Построить хронологию" (см. onSetStaleBranchesLookback в session.ts).
+  function renderStaleBranchesControls() {
+    return \`<div class="stale-branches-controls muted">Окно поиска — последние
+      <input type="number" id="staleBranchesLookbackInput" min="1" step="1" value="\${staleBranchesLookbackReleases}" style="width:3em;" />
+      релиз(ов). Изменение применится при следующем построении хронологии.</div>\`;
   }
 
+  function bindStaleBranchesLookbackInput() {
+    const input = document.getElementById('staleBranchesLookbackInput');
+    if (!input) return;
+    input.addEventListener('change', () => {
+      const value = parseInt(input.value, 10);
+      if (!Number.isFinite(value) || value < 1) {
+        input.value = String(staleBranchesLookbackReleases);
+        return;
+      }
+      staleBranchesLookbackReleases = value;
+      vscode.postMessage({ command: 'setStaleBranchesLookback', value });
+    });
+  }
+
+  function renderStaleBranchesLoading() {
+    document.getElementById('staleBranches').innerHTML = renderStaleBranchesControls() +
+      '<div class="muted inline-loading">Проверяем, нет ли забытых или не выбранных в релиз веток…</div>';
+    bindStaleBranchesLookbackInput();
+  }
+
+  // Два независимых сигнала под одной подсказкой (см. findStaleUnmergedBranches в planner.ts,
+  // runFindStaleBranches в session.ts): (а) ветка отсоединилась от dev раньше самой ранней выбранной
+  // в текущей хронологии ветки, (б) ветка просто не отмечена чекбоксом и не трогалась дольше "окна"
+  // последних N релизов — в обоих случаях смысл один: "возможно, где-то забытая задача".
   function renderStaleBranches(hints) {
     const el = document.getElementById('staleBranches');
+    let body;
     if (!hints || hints.length === 0) {
-      el.innerHTML = '<div class="muted">Более старых невлитых веток не нашлось.</div>';
-      return;
+      body = '<div class="muted">Забытых или давно не выбранных в релиз веток не нашлось.</div>';
+    } else {
+      body = '<div class="muted" style="margin:4px 0;">Отсоединились раньше самой ранней ветки в этой хронологии, либо не выбраны в релиз в пределах окна последних релизов, и ещё не выпущены — возможно, забыли:</div>' +
+        hints.map((h) => {
+          const link = h.commitUrl ? \`<a href="\${h.commitUrl}" target="_blank" rel="noopener">\${h.sha.slice(0,8)}</a>\` : h.sha.slice(0,8);
+          const taskLink = h.taskUrl ? \` · <a href="\${h.taskUrl}" target="_blank" rel="noopener">задача</a>\` : '';
+          return \`<div class="stale-branch-row">→ <b>\${escapeHtml(h.branch)}</b> — «\${escapeHtml(h.subject)}», \${link} · \${escapeHtml(h.authorName)} · \${formatDate(h.authorDate)}\${taskLink}</div>\`;
+        }).join('');
     }
-    el.innerHTML = '<div class="muted" style="margin-bottom:4px;">Отсоединились раньше самой ранней ветки в этой хронологии и ещё не выпущены — возможно, забыли:</div>' +
-      hints.map((h) => {
-        const link = h.commitUrl ? \`<a href="\${h.commitUrl}" target="_blank" rel="noopener">\${h.sha.slice(0,8)}</a>\` : h.sha.slice(0,8);
-        return \`<div class="stale-branch-row">→ <b>\${escapeHtml(h.branch)}</b> — «\${escapeHtml(h.subject)}», \${link} · \${escapeHtml(h.authorName)} · \${formatDate(h.authorDate)}</div>\`;
-      }).join('');
+    el.innerHTML = renderStaleBranchesControls() + body;
+    bindStaleBranchesLookbackInput();
   }
 
   document.getElementById('createBranchBtn').addEventListener('click', () => {
@@ -771,7 +834,8 @@ export class ReleasePanel {
         hint = '<div class="conflict-hint">Возможно, дело не в противоречащих правках, а в забытой задаче — эти ветки тоже меняют конфликтующий файл и ещё не выпущены:</div>' +
           uniqueCauses.map((c) => {
             const link = c.commitUrl ? \`<a href="\${c.commitUrl}" target="_blank" rel="noopener">\${c.sha.slice(0,8)}</a>\` : c.sha.slice(0,8);
-            return \`<div class="conflict-cause">→ <b>\${escapeHtml(c.branch)}</b> — «\${escapeHtml(c.subject)}», \${link} · \${escapeHtml(c.authorName)} · \${formatDate(c.authorDate)}</div>\`;
+            const taskLink = c.taskUrl ? \` · <a href="\${c.taskUrl}" target="_blank" rel="noopener">задача</a>\` : '';
+            return \`<div class="conflict-cause">→ <b>\${escapeHtml(c.branch)}</b> — «\${escapeHtml(c.subject)}», \${link} · \${escapeHtml(c.authorName)} · \${formatDate(c.authorDate)}\${taskLink}</div>\`;
           }).join('');
       } else {
         hint = '<div class="conflict-hint muted">Других веток, трогающих этот файл и ещё не выпущенных, не нашлось — похоже, конфликт придётся разрешить вручную.</div>';
@@ -860,11 +924,15 @@ export class ReleasePanel {
   const MERGE_SUBJECT_RE = /^Merged in (\\S+) \\(pull request #(\\d+)\\)/;
 
   function computeRail(merged) {
-    const laneOf = new Map();
-    let nextLane = 1;
+    // Порядок первого появления веток среди 'item'-строк — нужен только чтобы знать, какие ветки
+    // вообще есть, и как стабильный запасной порядок; конкретный НОМЕР лейна назначается позже,
+    // отдельным проходом (см. ниже) на основе реальных временных диапазонов, а не порядка появления.
+    const branchOrder = [];
+    const seenBranches = new Set();
     merged.forEach((row) => {
-      if (row.kind === 'item' && !laneOf.has(row.item.branch)) {
-        laneOf.set(row.item.branch, nextLane++);
+      if (row.kind === 'item' && !seenBranches.has(row.item.branch)) {
+        seenBranches.add(row.item.branch);
+        branchOrder.push(row.item.branch);
       }
     });
 
@@ -882,14 +950,14 @@ export class ReleasePanel {
     merged.forEach((row, idx) => {
       if (row.kind !== 'mergeMarker') return;
       const m = MERGE_SUBJECT_RE.exec((row.commit.subject || '').trim());
-      if (m && laneOf.has(m[1])) {
+      if (m && seenBranches.has(m[1])) {
         if (!mergeRowsByBranch.has(m[1])) mergeRowsByBranch.set(m[1], []);
         mergeRowsByBranch.get(m[1]).push(idx);
       }
     });
 
     const ranges = new Map();
-    for (const branch of laneOf.keys()) {
+    for (const branch of branchOrder) {
       let start = null;
       let lastOwnRow = null;
       merged.forEach((row, idx) => {
@@ -908,14 +976,47 @@ export class ReleasePanel {
       ranges.set(branch, { start, end: lastOwnRow, mergedAtRow, intermediateMergeRows });
     }
 
+    // Назначение лейнов — greedy упаковка интервалов (тот же приём, что в календарях/Gantt-чартах
+    // для непересекающихся событий на одной "полосе"): ветки обрабатываются в порядке начала, и
+    // каждая занимает МИНИМАЛЬНЫЙ лейн, чей предыдущий "жилец" уже закрылся (влился обратно в dev)
+    // строго до её начала — а не всегда новый лейн по счётчику. Раньше здесь был монотонный
+    // nextLane++ на каждую новую ветку, из-за чего дорожки только растущей "лесенкой" расходились
+    // вправо, даже когда реального пересечения по времени не было (ветка создалась, залилась в dev,
+    // потом уже следующая создалась) — визуально не имеет смысла, если ветки не жили параллельно.
+    const totalRows = merged.length;
+    const closeRowOf = (branch) => {
+      const r = ranges.get(branch);
+      return r.mergedAtRow !== null ? r.mergedAtRow : totalRows - 1;
+    };
+    const byStart = [...branchOrder].sort((a, b) => ranges.get(a).start - ranges.get(b).start);
+    const laneOf = new Map();
+    const laneClosedAt = []; // laneClosedAt[i] — строка, на которой закрылся текущий "жилец" лейна i
+    for (const branch of byStart) {
+      const start = ranges.get(branch).start;
+      let lane = laneClosedAt.findIndex((closedAt) => closedAt < start);
+      if (lane === -1) {
+        lane = laneClosedAt.length;
+        laneClosedAt.push(-1);
+      }
+      laneClosedAt[lane] = closeRowOf(branch);
+      laneOf.set(branch, lane + 1); // +1: лейн 0 зарезервирован под ствол dev (см. laneX)
+    }
+
     return { laneOf, ranges, mergeRowsByBranch };
   }
 
   const RAIL_LANE_W = 18;
   const RAIL_DOT_R = 4.5;
 
+  // Максимальный НОМЕР лейна, а не rail.laneOf.size (число веток) — с переиспользованием лейнов
+  // (см. computeRail) веток может быть больше, чем реально одновременно занятых дорожек, и ширину
+  // не нужно раздувать под каждую ветку по отдельности.
   function railWidth(rail) {
-    return (rail.laneOf.size + 1) * RAIL_LANE_W;
+    let maxLane = 0;
+    for (const lane of rail.laneOf.values()) {
+      if (lane > maxLane) maxLane = lane;
+    }
+    return (maxLane + 1) * RAIL_LANE_W;
   }
 
   function laneX(lane) {
@@ -936,6 +1037,17 @@ export class ReleasePanel {
     // используется наведением мыши, чтобы подсветить всю ветку целиком (см. wireRailHover).
     const dataAttr = branch ? \` data-branch="\${branch}"\` : '';
     return \`<circle cx="\${x}" cy="\${y}" r="\${RAIL_DOT_R + 2}" class="rail-halo"\${dataAttr} /><circle cx="\${x}" cy="\${y}" r="\${RAIL_DOT_R}" fill="\${color}"\${dataAttr} />\`;
+  }
+
+  // Большие числа (редкий, но реальный случай — squash-коммит на сотни строк) не должны раздувать
+  // строку — округляем до "1.2k" вместо полного числа, а не просто обрезаем цифры. Раньше эти числа
+  // рисовались прямо на графе (вертикальным текстом вдоль дорожки ветки), но при мелком шрифте и
+  // развороте в разные стороны у "+" и "-" читать их было практически невозможно — перенесены в
+  // конец текстовой строки коммита, к остальным ссылкам (см. renderLinks/renderDiffStatInline).
+  function formatDiffCount(n) {
+    if (n < 1000) return String(n);
+    if (n < 10000) return (n / 1000).toFixed(1).replace(/\\.0$/, '') + 'k';
+    return Math.round(n / 1000) + 'k';
   }
 
   // Наведение мыши на любую точку коммита/слияния с data-branch подсвечивает ВСЮ дорожку этой ветки
@@ -976,6 +1088,10 @@ export class ReleasePanel {
     const lines = [];
     const dots = [];
 
+    // Ствол dev — как и любая ветка, продолжается и ЗА пределами показанного окна (та же
+    // пунктирная "шапка" сверху, что у веток без видимой точки ветвления, см. ниже) — раньше он
+    // просто начинался вплотную к первой строке, без этого сигнала "тут не всё, есть история раньше".
+    lines.push(\`<path d="M \${trunkX},-2 L \${trunkX},\${rowCenters[0]}" stroke="\${trunkColor}" stroke-dasharray="3 3" class="rail-line" />\`);
     lines.push(\`<path d="M \${trunkX},\${rowCenters[0]} L \${trunkX},\${lastY}" stroke="\${trunkColor}" class="rail-line" />\`);
     merged.forEach((row, idx) => {
       if (row.kind === 'item') return;
@@ -1306,6 +1422,7 @@ export class ReleasePanel {
       showError('');
       document.getElementById('branchList').innerHTML = '<div class="muted branch-list-loading">Загрузка веток…</div>';
       document.getElementById('branchListInfo').textContent = 'Загрузка списка веток…';
+      lastStaleHints = null;
       document.getElementById('staleBranches').innerHTML = '';
       copiedCherryCmdKeys.clear();
       renderItems();
@@ -1315,9 +1432,12 @@ export class ReleasePanel {
       document.getElementById('mainBranchName').textContent = msg.mainBranch;
       configMainBranch = msg.mainBranch;
       configDevBranch = msg.devBranch;
+      staleBranchesLookbackReleases = msg.staleBranchesLookbackReleases;
       document.getElementById('hideInMainFilterBranchName').textContent = configMainBranch;
       document.getElementById('branchListLimitBtn').title = \`Применяет флажок «Скрыть в \${configMainBranch}» и лимит показа вместе\`;
       setPullBusy(false);
+      // Блок "Забытые ветки" ещё не показан на этот момент (хронология не построена) — просто
+      // запоминаем значение для инпута, который появится вместе с самим блоком (см. renderStaleBranches*).
     } else if (msg.command === 'branches') {
       setBranchListLimitBusy(false);
       setRefreshBusy(false);
@@ -1365,6 +1485,7 @@ export class ReleasePanel {
     } else if (msg.command === 'planBuilt') {
       setBuildPlanBusy(false);
       currentPlan = msg.plan;
+      lastStaleHints = null;
       document.getElementById('staleBranches').innerHTML = '';
       copiedCherryCmdKeys.clear();
       renderItems();
@@ -1372,6 +1493,7 @@ export class ReleasePanel {
     } else if (msg.command === 'staleBranchesLoading') {
       renderStaleBranchesLoading();
     } else if (msg.command === 'staleBranches') {
+      lastStaleHints = msg.hints;
       renderStaleBranches(msg.hints);
     } else if (msg.command === 'progress') {
       if (!currentPlan) return;

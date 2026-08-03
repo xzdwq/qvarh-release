@@ -340,6 +340,15 @@ export class GitService {
    * при обходе `--all` — не всегда единственно верное "чьё" это коммит (одна и та же история
    * бывает видна одновременно с нескольких веток), но для узкой задачи "какая ветка ещё не влита
    * и трогает этот файл" этого достаточно.
+   *
+   * `--no-merges` — иначе в кандидаты попадают технические merge-коммиты (веток, обновлявшихся от
+   * dev/main, или старые внутренние слияния release-веток) — у них нет своего осмысленного диффа,
+   * поэтому patch-id/subject+date сравнение (см. filterGenuineCandidates в planner.ts) никогда не
+   * находит для них совпадения в main, и такой merge-коммит ложно тянет за собой всю ветку в
+   * "возможные причины конфликта", даже если её РЕАЛЬНЫЕ (не-merge) коммиты давно и корректно
+   * распознаны как уже выпущенные (см. историю с hotfix/DOS-680 — merge-коммит `Merged in
+   * release-2023-07-13 (pull request #534)` внутри её собственной истории выглядел как "ещё не в
+   * main", хотя настоящий контент ветки — `[DOS-680] added mapping field names...` — там уже был).
    */
   async logCommitsNotInRefTouchingFile(
     mainRef: string,
@@ -353,6 +362,7 @@ export class GitService {
       '--not',
       mainRef,
       '--source',
+      '--no-merges',
       `--max-count=${maxCount}`,
       `--pretty=format:${format}%x1e`,
       '--',
@@ -640,12 +650,27 @@ export class GitService {
   }
 
   /** Файлы, изменённые коммитом относительно его первого родителя (единообразно для merge и обычных коммитов) */
-  async changedFiles(sha: string, firstParentSha: string): Promise<string[]> {
-    const raw = await this.git.raw(['diff', '--name-only', firstParentSha, sha]);
-    return raw
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean);
+  /**
+   * Список файлов и построчная статистика (--numstat) одним вызовом — раньше список файлов и
+   * статистика добавлений/удалений (для заливки на графе, см. drawRail в releasePanel.ts) были бы
+   * двумя отдельными git-вызовами на каждый коммит; --numstat отдаёт оба сразу за ту же цену. У
+   * бинарных файлов git пишет "-" вместо числа — такие строки не попадают в сумму insertions/deletions,
+   * но файл всё равно учитывается в списке files.
+   */
+  async diffStat(sha: string, firstParentSha: string): Promise<{ files: string[]; insertions: number; deletions: number }> {
+    const raw = await this.git.raw(['diff', '--numstat', firstParentSha, sha]);
+    const files: string[] = [];
+    let insertions = 0;
+    let deletions = 0;
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const [ins, del, ...fileParts] = trimmed.split('\t');
+      files.push(fileParts.join('\t'));
+      if (ins !== '-') insertions += Number(ins);
+      if (del !== '-') deletions += Number(del);
+    }
+    return { files, insertions, deletions };
   }
 
   async currentBranch(): Promise<string> {

@@ -54,6 +54,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
     const limitRaw = Number(values.branchListLimit);
     const branchListLimit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.floor(limitRaw) : 100;
+    const lookbackRaw = Number(values.staleBranchesLookbackReleases);
+    const staleBranchesLookbackReleases = Number.isFinite(lookbackRaw) && lookbackRaw > 0 ? Math.floor(lookbackRaw) : 4;
 
     const profile: ProjectProfile = {
       id: id ?? crypto.randomUUID(),
@@ -66,6 +68,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       branchListLimit,
       nonTaskBranchPrefixes: parseNonTaskBranchPrefixes(values.nonTaskBranchPrefixes ?? ''),
       hideDuplicateRemoteBranches: checkboxes.hideDuplicateRemoteBranches ?? true,
+      staleBranchesLookbackReleases,
       taskTrackerBaseUrl: values.taskTrackerBaseUrl?.trim() ?? '',
       bitbucketWorkspace: values.bitbucketWorkspace?.trim() ?? '',
       bitbucketRepoSlug: values.bitbucketRepoSlug?.trim() ?? '',
@@ -180,6 +183,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     <input type="text" id="proj_branchListLimit" placeholder="100" />
     <label>Префиксы служебных веток (через запятую)</label>
     <input type="text" id="proj_nonTaskBranchPrefixes" placeholder="qa, revert-pr-, chore/" />
+    <label>Окно поиска забытых веток (сколько последних релизов)</label>
+    <input type="text" id="proj_staleBranchesLookbackReleases" placeholder="4" />
     <div class="checkbox-field">
       <input type="checkbox" id="proj_hideDuplicateRemoteBranches" />
       <label for="proj_hideDuplicateRemoteBranches">Скрывать remote-ветку, если есть локальная с тем же именем</label>
@@ -208,7 +213,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
 <script>
   const vscode = acquireVsCodeApi();
-  const PROJECT_FIELDS = ['name','repositoryPath','mainBranch','devBranch','remoteName','releaseBranchPattern','branchListLimit','nonTaskBranchPrefixes','taskTrackerBaseUrl','bitbucketWorkspace','bitbucketRepoSlug'];
+  const PROJECT_FIELDS = ['name','repositoryPath','mainBranch','devBranch','remoteName','releaseBranchPattern','branchListLimit','nonTaskBranchPrefixes','staleBranchesLookbackReleases','taskTrackerBaseUrl','bitbucketWorkspace','bitbucketRepoSlug'];
   const PROJECT_CHECKBOX_FIELDS = ['hideDuplicateRemoteBranches'];
 
   let projects = [];

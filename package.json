@@ -2,7 +2,7 @@
   "name": "qvarh-release",
   "displayName": "Qvarh Release Builder",
   "description": "Визуальная сборка релизных веток из локальных git-веток: хронология коммитов, обнаружение зависимостей и cherry-pick",
-  "version": "0.20.0",
+  "version": "0.23.0",
   "publisher": "xzdwq",
   "author": "xzdwq",
   "private": true,
@@ -92,6 +92,12 @@
           "default": true,
           "description": "Скрывать remote-tracking ветку из списка, если для неё есть локальная пара с тем же именем (иначе почти все ветки показываются в списке дважды подряд)"
         },
+        "qvarhRelease.git.staleBranchesLookbackReleases": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "description": "Сколько последних релизных веток считать окном для поиска забытых/не выбранных в релиз веток (блок \"Забытые ветки\" в хронологии) — самая старая из них задаёт нижнюю границу поиска. Также редактируется прямо в этом блоке панели сборки релиза"
+        },
         "qvarhRelease.links.taskTrackerBaseUrl": {
           "type": "string",
           "default": "",
@@ -146,6 +152,9 @@
               },
               "hideDuplicateRemoteBranches": {
                 "type": "boolean"
+              },
+              "staleBranchesLookbackReleases": {
+                "type": "number"
               },
               "taskTrackerBaseUrl": {
                 "type": "string"

@@ -11,6 +11,16 @@ export interface ReleaseConfig {
   /** Скрывать remote-tracking ветку из списка, если для неё есть локальная пара с тем же именем (иначе почти все ветки показываются дважды) */
   hideDuplicateRemoteBranches: boolean;
   /**
+   * Сколько последних релизных веток (по шаблону releaseBranchPattern) считать "окном" для поиска
+   * забытых/не выбранных веток (см. StaleBranchHint, findStaleUnmergedBranches в planner.ts) —
+   * дата самой старой из них становится верхней границей поиска (--until), наравне с датой самой
+   * ранней выбранной в текущей хронологии ветки (берётся более ПОЗДНЯЯ из двух — иначе окно поиска
+   * сужалось бы, а не расширялось). Меняется прямо в блоке
+   * "Забытые ветки" панели сборки релиза; изменение применяется со следующего построения
+   * хронологии, а не мгновенно (сам список уже построен и переопределять его на лету незачем).
+   */
+  staleBranchesLookbackReleases: number;
+  /**
    * Базовый URL задачи в таск-трекере, без ключа задачи — ключ добавляется через "/" (например,
    * для Jira это https://your-company.atlassian.net/browse; подойдёт любой трекер, где страница
    * задачи открывается по адресу вида "базовый-url/КЛЮЧ-ЗАДАЧИ").
@@ -100,6 +110,8 @@ export interface ConflictCause {
   authorDate: string;
   /** Короткое имя ветки-кандидата (без remote-префикса) */
   branch: string;
+  /** Ссылка на задачу в таск-трекере, вычисленная из ключа в имени ветки/subject коммита; null, если ключ не найден или трекер не настроен */
+  taskUrl: string | null;
   commitUrl: string | null;
 }
 
@@ -130,6 +142,9 @@ export interface ConflictSource {
 export interface PlanItem extends CommitInfo {
   branch: string;
   files: string[];
+  /** Число добавленных/удалённых строк (git diff --numstat к первому родителю) — для заливки на графе, см. drawRail в releasePanel.ts. Бинарные файлы не учитываются (git показывает "-" вместо числа). */
+  insertions: number;
+  deletions: number;
   included: boolean;
   applied: boolean;
   /** sha других включённых коммитов (с других веток), которые правят те же файлы */
@@ -191,10 +206,12 @@ export interface MergeEventInfo {
 }
 
 /**
- * Ветка, которая отсоединилась от dev РАНЬШЕ самой ранней выбранной в хронологии ветки и всё ещё
- * не выпущена в main — подсказка "возможно, где-то ещё есть забытая, давно не трогаемая задача"
- * (см. findStaleUnmergedBranches в planner.ts). Строится по кнопке, не автоматически — это
- * широкий скан по всему репозиторию, дороже узкого поиска причины конфликта.
+ * Ветка, которая ещё не выпущена в main и либо (а) отсоединилась от dev РАНЬШЕ самой ранней
+ * выбранной в хронологии ветки, либо (б) просто не отмечена чекбоксом в текущей выборке и не
+ * трогалась дольше "окна" последних N релизов (см. staleBranchesLookbackReleases в конфиге) —
+ * в обоих случаях подсказка одна: "возможно, где-то есть забытая, давно не трогаемая задача"
+ * (см. findStaleUnmergedBranches в planner.ts). Считается автоматически после каждой пересборки
+ * хронологии — широкий скан по всему репозиторию, поэтому не блокирует её показ (см. postStaleBranchesLoading).
  */
 export interface StaleBranchHint {
   branch: string;
@@ -202,6 +219,7 @@ export interface StaleBranchHint {
   subject: string;
   authorDate: string;
   authorName: string;
+  taskUrl: string | null;
   commitUrl: string | null;
 }
 

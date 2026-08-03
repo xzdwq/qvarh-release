@@ -12,6 +12,7 @@ export function readConfig(): ReleaseConfig {
     branchListLimit: cfg.get<number>('git.branchListLimit', 100),
     nonTaskBranchPrefixes: parseNonTaskBranchPrefixes(cfg.get<string>('git.nonTaskBranchPrefixes', 'qa, revert-pr-, chore/')),
     hideDuplicateRemoteBranches: cfg.get<boolean>('git.hideDuplicateRemoteBranches', true),
+    staleBranchesLookbackReleases: cfg.get<number>('git.staleBranchesLookbackReleases', 4),
     taskTrackerBaseUrl: cfg.get<string>('links.taskTrackerBaseUrl', ''),
     bitbucketWorkspace: cfg.get<string>('links.bitbucketWorkspace', ''),
     bitbucketRepoSlug: cfg.get<string>('links.bitbucketRepoSlug', ''),
@@ -27,10 +28,14 @@ export function readConfig(): ReleaseConfig {
  */
 export function readProjects(): ProjectProfile[] {
   const projects = vscode.workspace.getConfiguration('qvarhRelease').get<ProjectProfile[]>('projects', []);
-  // Профили, сохранённые ДО появления hideDuplicateRemoteBranches, физически не содержат это поле
-  // в хранимом JSON — без явного бэкофилла оно осталось бы undefined (не default true), и галочка
-  // в настройках выглядела бы включённой, а фильтрация в списке веток молча не работала бы.
-  return projects.map((p) => ({ ...p, hideDuplicateRemoteBranches: p.hideDuplicateRemoteBranches ?? true }));
+  // Профили, сохранённые ДО появления hideDuplicateRemoteBranches/staleBranchesLookbackReleases,
+  // физически не содержат эти поля в хранимом JSON — без явного бэкофилла они остались бы
+  // undefined (не свои default-значения).
+  return projects.map((p) => ({
+    ...p,
+    hideDuplicateRemoteBranches: p.hideDuplicateRemoteBranches ?? true,
+    staleBranchesLookbackReleases: p.staleBranchesLookbackReleases ?? 4,
+  }));
 }
 
 export async function saveProjects(projects: ProjectProfile[]): Promise<void> {

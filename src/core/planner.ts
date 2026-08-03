@@ -296,8 +296,8 @@ async function collectBranchItems(
     extraBaseRefs
   );
 
-  const filesList = await mapWithConcurrency(commits, CONCURRENCY, (commit) =>
-    git.changedFiles(commit.sha, commit.parents[0] ?? EMPTY_TREE_SHA)
+  const diffStats = await mapWithConcurrency(commits, CONCURRENCY, (commit) =>
+    git.diffStat(commit.sha, commit.parents[0] ?? EMPTY_TREE_SHA)
   );
 
   const items: PlanItem[] = commits.map((commit, i) => ({
@@ -308,7 +308,9 @@ async function collectBranchItems(
     authorName: commit.authorName,
     alreadyInMain: false, // проставляется одним общим проходом в buildPlanItems (см. markAlreadyInMain)
     branch: branch.name,
-    files: filesList[i],
+    files: diffStats[i].files,
+    insertions: diffStats[i].insertions,
+    deletions: diffStats[i].deletions,
     included: true,
     applied: false,
     overlapsWith: [],
@@ -598,7 +600,7 @@ async function filterGenuineCandidates(
   for (const c of genuine) {
     const existing = byBranch.get(c.branch);
     if (!existing || c.authorDate > existing.authorDate) {
-      byBranch.set(c.branch, { sha: c.sha, subject: c.subject, authorName: c.authorName, authorDate: c.authorDate, branch: c.branch, commitUrl: null });
+      byBranch.set(c.branch, { sha: c.sha, subject: c.subject, authorName: c.authorName, authorDate: c.authorDate, branch: c.branch, taskUrl: null, commitUrl: null });
     }
   }
   return [...byBranch.values()].sort((a, b) => (a.authorDate < b.authorDate ? 1 : -1)).slice(0, limit);
@@ -617,24 +619,34 @@ export async function findConflictCauses(
 }
 
 /**
- * Ветки, которые отделились от dev РАНЬШЕ самой ранней выбранной в текущей хронологии ветки и всё
- * ещё не слиты В САМУ dev-ветку — подсказка "возможно, где-то есть забытая, давно не трогаемая
- * задача", которую вы не выбрали (или забыли), потому что она была заведена задолго до остальных.
- * Сверяется именно с devRef, а не с main: ветка, уже слитая в dev, но ещё не выпущенная релизом в
- * main, — это нормальное состояние "ждёт своего релиза", а не "забытая задача", и не должна сюда
- * попадать. Считается автоматически при каждом построении хронологии, но не блокирует её показ —
- * это широкий скан по ВСЕМУ репозиторию (в отличие от узкого findConflictCauses, привязанного к
- * одному файлу), поэтому запускается отдельно и результат подгружается следом, с индикатором загрузки.
+ * Ветки, которые ещё не выпущены в main и либо (а) отделились от dev РАНЬШЕ самой ранней выбранной
+ * в текущей хронологии ветки, либо (б) просто не отмечены чекбоксом сейчас и не трогались дольше
+ * "окна" последних N релизных веток — в обоих случаях подсказка одна: "возможно, где-то есть
+ * забытая, давно не трогаемая задача, которую вы не выбрали". beforeDateIso — уже посчитанная
+ * снаружи (см. session.ts) верхняя граница поиска (--until) — самая ПОЗДНЯЯ из двух: дата earliest-
+ * выбранного коммита и дата самой старой из последних N релизных веток (так сигналы (а) и (б)
+ * объединяются по ИЛИ, а не по И — берём более раннюю дату, окно бы только сужалось).
+ *
+ * Сверяется с mainRef (а не с devRef): ветка, уже слитая в dev, но ЕЩЁ НЕ выпущенная релизом —
+ * это ОБЪЕКТИВНО "не в main", и это ровно то, что должно попадать в подсказку, если её никто не
+ * выбирал в релиз достаточно долго (несколько релизных циклов) — раньше сверка шла с devRef именно
+ * чтобы НЕ считать "ждёт своего релиза" забытой задачей, но без разумного временного окна это было
+ * слишком узко: реальный пример — ветка, влитая в dev и намеренно не выбранная в текущий релиз,
+ * должна быть видна здесь, а не молчать только потому, что она технически уже в dev.
+ *
+ * Считается автоматически при каждом построении хронологии, но не блокирует её показ — это широкий
+ * скан по ВСЕМУ репозиторию (в отличие от узкого findConflictCauses, привязанного к одному файлу),
+ * поэтому запускается отдельно и результат подгружается следом, с индикатором загрузки.
  */
 export async function findStaleUnmergedBranches(
   git: GitService,
-  devRef: string,
+  mainRef: string,
   beforeDateIso: string,
   excludeShas: Set<string>,
   isIgnorableCandidate: (name: string) => boolean,
   remoteName: string
 ): Promise<StaleBranchHint[]> {
-  const raw = await git.logCommitsNotInRefBeforeDate(devRef, beforeDateIso, MAX_STALE_CANDIDATES);
-  const causes = await filterGenuineCandidates(git, devRef, raw, excludeShas, isIgnorableCandidate, remoteName, 10);
-  return causes.map(({ branch, sha, subject, authorName, authorDate, commitUrl }) => ({ branch, sha, subject, authorName, authorDate, commitUrl }));
+  const raw = await git.logCommitsNotInRefBeforeDate(mainRef, beforeDateIso, MAX_STALE_CANDIDATES);
+  const causes = await filterGenuineCandidates(git, mainRef, raw, excludeShas, isIgnorableCandidate, remoteName, 10);
+  return causes.map(({ branch, sha, subject, authorName, authorDate, taskUrl, commitUrl }) => ({ branch, sha, subject, authorName, authorDate, taskUrl, commitUrl }));
 }

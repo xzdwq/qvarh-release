@@ -6,9 +6,11 @@ import {
   extractTaskKey,
   formatReleaseBranch,
   readConfig,
+  readProjects,
   releaseBranchMatcher,
   resolveBitbucketRepoSlug,
   resolveRepositoryPath,
+  saveProjects,
 } from './config';
 import { performDryRun } from './core/dryRun';
 import { applyAll, applyNextItem, resolveConflictAndContinue, skipConflictingItem } from './core/executor';
@@ -42,6 +44,13 @@ export class ReleaseSession implements ReleasePanelHost {
   private panel!: ReleasePanel;
   /** true после успешного ensureClients() в start()/resume() — см. onRefreshBranches. */
   private ready = false;
+  /**
+   * id сохранённого профиля проекта, если панель открыта именно для него (см. start()), иначе
+   * undefined — "текущий workspace". Нужен, чтобы понять, КУДА сохранять staleBranchesLookbackReleases
+   * при изменении прямо в панели (см. onSetStaleBranchesLookback): в конкретный профиль в
+   * qvarhRelease.projects или в единый workspace-конфиг qvarhRelease.git.*.
+   */
+  private projectId: string | undefined;
 
   /** Полный список веток репозитория (без ограничения) — источник истины для выбора/поиска. */
   private fullBranches: BranchRef[] = [];
@@ -449,7 +458,7 @@ export class ReleaseSession implements ReleasePanelHost {
 
   private async postCurrentBranch(): Promise<void> {
     const current = await this.git.currentBranch();
-    this.panel.postCurrentBranch(current, this.config.mainBranch, this.config.devBranch);
+    this.panel.postCurrentBranch(current, this.config.mainBranch, this.config.devBranch, this.config.staleBranchesLookbackReleases);
   }
 
   private selectedBranchRefs(): BranchRef[] {
@@ -569,7 +578,7 @@ export class ReleaseSession implements ReleasePanelHost {
     this.persist();
     this.panel.postPlan(this.plan);
     this.panel.postStaleBranchesLoading();
-    void this.runFindStaleBranches(generation, devRef);
+    void this.runFindStaleBranches(generation, mainRef);
 
     const warnings: string[] = [];
     if (skipped.length > 0) {
@@ -602,6 +611,7 @@ export class ReleaseSession implements ReleasePanelHost {
    */
   async start(extensionUri: vscode.Uri, overrideConfig?: ReleaseConfig, projectContext?: PanelContext): Promise<void> {
     this.panel = ReleasePanel.createOrShow(extensionUri, this, projectContext);
+    this.projectId = projectContext?.projectId;
     try {
       await this.ensureClients(overrideConfig);
       this.ready = true;
@@ -724,27 +734,52 @@ export class ReleaseSession implements ReleasePanelHost {
   }
 
   /**
+   * Дата самой старой из последних N релизных веток (по шаблону releaseBranchPattern, сортировка
+   * по дате последнего коммита — простое и дешёвое приближение "когда был этот релиз", без единого
+   * дополнительного git-вызова, т.к. this.fullBranches уже загружен). null, если релизных веток
+   * меньше N (в т.ч. вовсе нет) — тогда этот сигнал просто не участвует в поиске забытых веток,
+   * остаётся только "раньше самой ранней выбранной".
+   */
+  private findReleaseLookbackDate(n: number): string | null {
+    const isReleaseBranch = releaseBranchMatcher(this.config.releaseBranchPattern);
+    const releaseBranches = this.fullBranches
+      .filter((b) => isReleaseBranch(b.name) && b.lastCommitDate)
+      .sort((a, b) => (a.lastCommitDate > b.lastCommitDate ? -1 : 1));
+    if (releaseBranches.length < n) return null;
+    return releaseBranches[n - 1].lastCommitDate;
+  }
+
+  /**
    * Автоматически, сразу после построения хронологии (см. rebuildPlan), но НЕ блокируя её показ —
    * широкий скан по ВСЕМУ репозиторию (дороже узкого findConflictCauses), поэтому запускается
    * отдельно от остального построения плана и результат подгружается следом (панель тем временем
-   * показывает индикатор загрузки — см. postStaleBranchesLoading). Ищет ветки, отсоединившиеся от
-   * dev РАНЬШЕ самой ранней ветки в текущей хронологии и всё ещё не слитые в саму dev (не в main —
-   * ветка, уже влитая в dev, но ещё не выпущенная релизом, это норма, а не "забытая задача"). Ошибки
-   * тут намеренно не всплывают наверх и не портят уже показанную хронологию — это необязательная
+   * показывает индикатор загрузки — см. postStaleBranchesLoading). Ищет ветки, ещё не выпущенные в
+   * main и либо отсоединившиеся РАНЬШЕ самой ранней ветки в текущей хронологии, либо просто не
+   * отмеченные чекбоксом сейчас и не трогавшиеся дольше окна последних staleBranchesLookbackReleases
+   * релизов (более ПОЗДНЯЯ из двух дат в качестве верхней границы `--until` — так шире, чем любой
+   * сигнал по отдельности, а не уже). Ошибки тут
+   * намеренно не всплывают наверх и не портят уже показанную хронологию — это необязательная
    * подсказка, а не критичная часть построения плана. `generation` защищает от гонки: если, пока
    * шёл скан, выбор веток уже поменялся и построился новый план, устаревший результат просто не
    * отправляется в панель.
    */
-  private async runFindStaleBranches(generation: number, devRef: string): Promise<void> {
+  private async runFindStaleBranches(generation: number, mainRef: string): Promise<void> {
     if (!this.plan) return;
-    const earliestDate = this.plan.items.reduce((min, i) => (i.authorDate < min ? i.authorDate : min), this.plan.items[0].authorDate);
+    const earliestSelectedDate = this.plan.items.reduce((min, i) => (i.authorDate < min ? i.authorDate : min), this.plan.items[0].authorDate);
+    const releaseLookbackDate = this.findReleaseLookbackDate(this.config.staleBranchesLookbackReleases);
+    // MAX, а не MIN: --until в logCommitsNotInRefBeforeDate — верхняя граница (коммиты ДО этой
+    // даты), поэтому объединение "по ИЛИ" двух сигналов (раньше earliestSelectedDate ИЛИ раньше
+    // releaseLookbackDate) даёт именно более позднюю из двух дат — раньше здесь по ошибке стояла
+    // более РАННЯЯ (MIN), которая только сужала окно относительно исходного earliestSelectedDate
+    // и могла вовсе потерять сигнал (б), а не расширить поиск, как задумано.
+    const beforeDate = releaseLookbackDate && releaseLookbackDate > earliestSelectedDate ? releaseLookbackDate : earliestSelectedDate;
     const excludeShas = new Set(this.plan.items.map((i) => i.sha));
     let hints: Awaited<ReturnType<typeof findStaleUnmergedBranches>> = [];
     try {
       hints = await findStaleUnmergedBranches(
         this.git,
-        devRef,
-        earliestDate,
+        mainRef,
+        beforeDate,
         excludeShas,
         (name) => this.isIgnorableCandidateName(name),
         this.config.remoteName
@@ -753,8 +788,30 @@ export class ReleaseSession implements ReleasePanelHost {
       hints = [];
     }
     if (generation !== this.planGeneration) return;
-    const withLinks = hints.map((h) => ({ ...h, commitUrl: this.buildLinks('', h.subject, h.sha, null).commitUrl }));
+    const withLinks = hints.map((h) => ({ ...h, ...this.buildLinks(h.branch, h.subject, h.sha, null) }));
     this.panel.postStaleBranches(withLinks);
+  }
+
+  /**
+   * Меняет "окно" поиска забытых веток (см. runFindStaleBranches) — редактируется прямо в блоке
+   * панели, не в настройках. Сохраняется в ТОТ ЖЕ профиль, для которого открыта панель (если это
+   * сохранённый проект — см. this.projectId), иначе в единый workspace-конфиг qvarhRelease.git.*.
+   * Не пересчитывает уже показанный список сразу — как и с лимитом показа веток, новое значение
+   * учитывается со следующего построения хронологии.
+   */
+  async onSetStaleBranchesLookback(n: number): Promise<void> {
+    const normalized = Number.isFinite(n) && n > 0 ? Math.floor(n) : this.config.staleBranchesLookbackReleases;
+    this.config.staleBranchesLookbackReleases = normalized;
+    if (this.projectId) {
+      const projects = readProjects();
+      const index = projects.findIndex((p) => p.id === this.projectId);
+      if (index >= 0) {
+        projects[index] = { ...projects[index], staleBranchesLookbackReleases: normalized };
+        await saveProjects(projects);
+      }
+    } else {
+      await vscode.workspace.getConfiguration('qvarhRelease').update('git.staleBranchesLookbackReleases', normalized, vscode.ConfigurationTarget.Global);
+    }
   }
 
   async onToggleItem(sha: string, included: boolean): Promise<void> {
@@ -821,7 +878,7 @@ export class ReleaseSession implements ReleasePanelHost {
           (name) => this.isIgnorableCandidateName(name),
           this.config.remoteName
         );
-        source.possibleCauses = causes.map((c) => ({ ...c, commitUrl: this.buildLinks('', c.subject, c.sha, null).commitUrl }));
+        source.possibleCauses = causes.map((c) => ({ ...c, ...this.buildLinks(c.branch, c.subject, c.sha, null) }));
       }
     }
   }
