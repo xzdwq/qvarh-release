@@ -94,6 +94,25 @@ export interface CommitInfo {
   commitUrl: string | null;
 }
 
+/** CommitInfo + число добавленных/удалённых строк (см. GitService.diffStat) — только для превью коммитов ветки в списке (см. getBranchCommits в planner.ts), а не для CommitInfo в целом: контекстных/якорных коммитов хронологии на каждом построении плана и так много, лишний git-вызов на каждый был бы заметно дороже, а для них diffstat никто не просил. */
+export interface BranchCommitInfo extends CommitInfo {
+  insertions: number;
+  deletions: number;
+}
+
+/**
+ * Агрегированные +/- и число затронутых файлов по ВСЕМ собственным коммитам ветки сразу (см.
+ * computeMainStatusForBranches в planner.ts) — приближённая сводка для строки в списке веток, без
+ * разворачивания коммитов. Один git diff --numstat между первым родителем самого раннего
+ * собственного коммита и кончиком ветки (а не сумма diffStat по каждому коммиту отдельно) — так
+ * файлы, тронутые в нескольких коммитах подряд, считаются один раз, а не по числу коммитов.
+ */
+export interface BranchDiffStat {
+  insertions: number;
+  deletions: number;
+  filesChanged: number;
+}
+
 /** 'empty' — содержимое коммита УЖЕ полностью присутствует в основной ветке (пустой cherry-pick, см. GitService.cherryPickIntegrationCommit) — это не конфликт и не обычное применение, а подтверждённый на 100% (реальным git, не эвристикой) факт "уже выпущено". */
 export type DryRunStatus = 'untested' | 'ok' | 'conflict' | 'empty';
 

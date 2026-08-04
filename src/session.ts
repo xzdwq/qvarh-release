@@ -13,7 +13,7 @@ import {
   saveProjects,
 } from './config';
 import { performDryRun } from './core/dryRun';
-import { applyAll, applyNextItem, resolveConflictAndContinue, skipConflictingItem } from './core/executor';
+import { applyAll } from './core/executor';
 import {
   DevFirstParentShas,
   ExtraBaseRef,
@@ -21,6 +21,7 @@ import {
   buildPlanItems,
   computeMainStatusForBranches,
   findAnchorCommit,
+  findCommitsAlreadyInRef,
   findConflictCauses,
   findContextCommits,
   findStaleUnmergedBranches,
@@ -30,7 +31,7 @@ import { BranchRef, MergeEventInfo, PlanItem, ReleaseConfig, ReleasePlan } from 
 import { GitService, MergeEventDetails, mainSubjectDateKey } from './git/gitService';
 import { PanelContext, ReleasePanel, ReleasePanelHost } from './ui/releasePanel';
 
-const STATE_KEY = 'qvarhRelease.session.v3';
+const STATE_KEY_PREFIX = 'qvarhRelease.session.v3';
 
 interface PersistedState {
   releaseBranch: string;
@@ -110,6 +111,22 @@ export class ReleaseSession implements ReleasePanelHost {
     this.repoPath = resolveRepositoryPath(this.config);
     this.git = new GitService(this.repoPath);
     await this.git.assertRepo();
+  }
+
+  /**
+   * Панель — синглтон на всё расширение (см. ReleasePanel.createOrShow), а каждый клик по 🚀 (в т.ч.
+   * повторный по ТОМУ ЖЕ проекту) создаёт НОВУЮ ReleaseSession и тут же становится её хозяином —
+   * не дожидаясь, пока предыдущая ReleaseSession закончит СВОИ уже начатые git-вызовы. Без этой
+   * проверки перед каждым post-вызовом ПОСЛЕ await устаревшая сессия (переключились на другой
+   * проект/workspace до того, как её собственный refreshBranches()/rebuildPlan() и т.п. успел
+   * завершиться) молча дописывала бы свой результат в уже переключённую панель — список веток,
+   * хронология, ошибки предыдущего проекта "всплывали" бы поверх нового. Сам git-процесс (если уже
+   * запущен, например реальный cherry-pick при сборке) при этом НЕ прерывается — прерывать
+   * наполовину применённую сборку релиза было бы куда опаснее, чем просто не показать её прогресс;
+   * прекращается только отправка результатов в панель, которая больше не про этот проект.
+   */
+  private isActive(): boolean {
+    return this.panel.isCurrentHost(this);
   }
 
   /** Ссылки на таск-трекер/Bitbucket для ветки/коммита — по конфигу, без обращения к внешним API (см. src/config.ts). */
@@ -215,24 +232,41 @@ export class ReleaseSession implements ReleasePanelHost {
     return refs;
   }
 
+  /**
+   * Ключ persisted-состояния — с привязкой к репозиторию (this.repoPath, известен только после
+   * ensureClients()), а не один общий на всё расширение: один и тот же vscode workspace может
+   * держать несколько сохранённых профилей проектов (см. "Проекты" в боковой панели) на РАЗНЫЕ
+   * репозитории — раньше все они делили один и тот же ключ workspaceState, и сборка релиза для
+   * одного проекта могла молча "продолжиться" данными от совсем другого репозитория.
+   */
+  private stateKey(): string {
+    return `${STATE_KEY_PREFIX}:${this.repoPath}`;
+  }
+
   private persist(): void {
     const state: PersistedState = {
       releaseBranch: this.releaseBranch,
       selectedRefs: [...this.selectedRefs],
       plan: this.plan,
     };
-    void this.context.workspaceState.update(STATE_KEY, state);
-  }
-
-  static hasPersistedState(context: vscode.ExtensionContext): boolean {
-    return !!context.workspaceState.get<PersistedState>(STATE_KEY);
+    void this.context.workspaceState.update(this.stateKey(), state);
   }
 
   /** Заново читает список веток из git (дорого только сам git-вызов; отправка в панель — через sendBranchSlice). */
   private async refreshBranches(): Promise<void> {
     this.refsCache = null; // состояние репозитория могло поменяться (Pull/явный Refresh) — см. getRefsCache
     this.fullBranches = this.applyDuplicateBranchFilter(await this.git.listBranches());
+    this.postReleaseBranchPatternCount();
     await this.sendBranchSlice('');
+  }
+
+  /** Сколько веток в репозитории подходят под шаблон релизной ветки (releaseBranchPattern) — общая
+   * картина наверху панели ("сколько релизов вообще было"), не привязано к конкретной дате/сборке. */
+  private postReleaseBranchPatternCount(): void {
+    if (!this.isActive()) return;
+    const isReleaseBranch = releaseBranchMatcher(this.config.releaseBranchPattern);
+    const count = this.fullBranches.filter((b) => isReleaseBranch(b.name)).length;
+    this.panel.postReleaseBranchPatternCount(count);
   }
 
   /**
@@ -334,8 +368,9 @@ export class ReleaseSession implements ReleasePanelHost {
     // Устарел, пока считался быстрый статус "в main" — новее уже в пути, отправлять этот незачем
     // (и, что важнее, НЕЛЬЗЯ: без этой проверки более старый, но случайно завершившийся ПОЗЖЕ запрос
     // мог бы перезаписать в панели уже показанный новый/правильный результат — именно так выглядел
-    // баг "поиск находит нужное, а потом добавляет ещё лишнее").
-    if (generation !== this.branchSliceGeneration) return;
+    // баг "поиск находит нужное, а потом добавляет ещё лишнее"). !this.isActive() — тот же случай,
+    // но по другой причине: не просто устарел фильтр, а сменился ПРОЕКТ (см. isActive).
+    if (generation !== this.branchSliceGeneration || !this.isActive()) return;
 
     const sliceWithFlags = slice.map((b) => {
       const prNumber = mergeEvents.get(b.name)?.[0]?.prNumber ?? null;
@@ -418,10 +453,11 @@ export class ReleaseSession implements ReleasePanelHost {
       // этого исправления). Точность бейджа "в main" для единичных служебных веток вроде revert-pr-*
       // здесь не критична — она и так уточняется точно при явном разворачивании (см. getBranchCommits),
       // где эта же проверка стоит одного лишнего вызова, а не сотен.
-      const statusByRef = await computeMainStatusForBranches(this.git, slice, devRef, mainRef, devFirstParentShas);
-      if (generation !== this.branchSliceGeneration || statusByRef.size === 0) return;
+      const { statusByRef, diffStatByRef } = await computeMainStatusForBranches(this.git, slice, devRef, mainRef, devFirstParentShas);
+      if (generation !== this.branchSliceGeneration || !this.isActive()) return;
 
-      this.panel.postBranchMainStatus(Object.fromEntries(statusByRef));
+      if (statusByRef.size > 0) this.panel.postBranchMainStatus(Object.fromEntries(statusByRef));
+      if (diffStatByRef.size > 0) this.panel.postBranchDiffStats(Object.fromEntries(diffStatByRef));
     } catch {
       // см. комментарий выше — намеренно молча игнорируем
     }
@@ -447,17 +483,18 @@ export class ReleaseSession implements ReleasePanelHost {
   }
 
   private async warnIfCherryPickInProgress(): Promise<void> {
-    if (await this.git.isCherryPickInProgress()) {
+    if ((await this.git.isCherryPickInProgress()) && this.isActive()) {
       this.panel.postError(
         'В репозитории обнаружен незавершённый cherry-pick (вероятно, от прошлой сессии). ' +
           'Это может мешать переключению веток через интерфейс VS Code. ' +
-          'Разрешите конфликт и нажмите "Продолжить после конфликта", либо нажмите "Отменить сборку (cherry-pick --abort)" ниже.'
+          'Разрешите конфликт и нажмите "Начать сборку" ещё раз — она продолжит с того же места, либо нажмите "Отменить сборку (cherry-pick --abort)" ниже.'
       );
     }
   }
 
   private async postCurrentBranch(): Promise<void> {
     const current = await this.git.currentBranch();
+    if (!this.isActive()) return;
     this.panel.postCurrentBranch(current, this.config.mainBranch, this.config.devBranch, this.config.staleBranchesLookbackReleases);
   }
 
@@ -573,7 +610,7 @@ export class ReleaseSession implements ReleasePanelHost {
       dryRunWarning = `Проверка на конфликты не выполнена: ${err?.message ?? err}`;
     }
 
-    if (generation !== this.planGeneration) return;
+    if (generation !== this.planGeneration || !this.isActive()) return;
 
     this.persist();
     this.panel.postPlan(this.plan);
@@ -595,8 +632,164 @@ export class ReleaseSession implements ReleasePanelHost {
     if (dryRunWarning) {
       warnings.push(dryRunWarning);
     }
-    if (warnings.length > 0) {
+    if (warnings.length > 0 && this.isActive()) {
       this.panel.postError(warnings.join(' '));
+    }
+  }
+
+  /**
+   * Сверяет item.applied для ещё НЕ отмеченных как applied пунктов плана с РЕАЛЬНОЙ историей
+   * релизной ветки — по patch-id/subject+date (см. findCommitsAlreadyInRef в planner.ts), а не по
+   * git-ancestry исходного sha (после cherry-pick у коммита другой sha и родители). Нужно при
+   * восстановлении состояния после перезапуска VS Code (см. applyPersistedState) — persist()
+   * записывает applied после каждого шага применения, но если сессия закрылась ДО того, как это
+   * успело сохраниться, или пользователь успел применить что-то в релизной ветке НЕ через это
+   * расширение, сохранённый флаг отстаёт от реальности. Можно собирать релиз частями в несколько
+   * заходов (сейчас часть коммитов, после перезагрузки — остальное) — именно для этого сверка и
+   * должна идти по факту git-истории, а не вслепую доверять старому снимку.
+   */
+  private async syncAppliedFromReleaseBranch(): Promise<void> {
+    if (!this.plan || !this.releaseBranch) return;
+    const notYetApplied = this.plan.items.filter((i) => !i.applied);
+    if (notYetApplied.length === 0) return;
+    const appliedShas = await findCommitsAlreadyInRef(this.git, this.releaseBranch, notYetApplied);
+    if (appliedShas.size === 0) return;
+    for (const item of notYetApplied) {
+      if (appliedShas.has(item.sha)) {
+        item.applied = true;
+      }
+    }
+  }
+
+  /** Пустой, но валидный план — только чтобы клиент узнал releaseBranch (см. updateBuildButtonsState в releasePanel.ts, читает currentPlan.releaseBranch), когда настоящей хронологии ещё нет. */
+  private emptyPlanFor(releaseBranch: string): ReleasePlan {
+    return {
+      releaseBranch,
+      mainBranch: '',
+      items: [],
+      contextCommits: [],
+      contextCommitsTruncated: false,
+      anchorCommit: null,
+      mergeEventsByBranch: {},
+    };
+  }
+
+  /**
+   * Сверяет item.alreadyInMain со свежим состоянием mainRef, а не доверяет значению из
+   * персистентного/сохранённого снимка плана. alreadyInMain, в отличие от item.applied, не должен
+   * меняться от действий самой сборки релиза — но снимок в workspaceState мог быть посчитан ДО
+   * того, как main реально получил этот диф (или до исправления самой эвристики сравнения в более
+   * старой версии расширения), и без пересчёта восстановленная хронология показывала бы бейдж
+   * "уже в main", посчитанный неизвестно когда, а не по факту текущей истории main.
+   */
+  private async syncAlreadyInMainFromCurrentState(mainRef: string): Promise<void> {
+    if (!this.plan || this.plan.items.length === 0) return;
+    const alreadyInMainShas = await findCommitsAlreadyInRef(this.git, mainRef, this.plan.items);
+    for (const item of this.plan.items) {
+      item.alreadyInMain = alreadyInMainShas.has(item.sha);
+    }
+  }
+
+  /**
+   * Общая часть start()/resume() ПОСЛЕ того, как this.releaseBranch/selectedRefs/plan уже
+   * выставлены вызывающим кодом — пересчитывает mergeEventsByBranch (dev могла продолжить жить
+   * между сессиями), сверяет applied/alreadyInMain с реальностью (см. syncAppliedFromReleaseBranch/
+   * syncAlreadyInMainFromCurrentState) и перепрогоняет dry-run на АКТУАЛЬНЫХ данных (а не
+   * показывает застывший снимок — см. runDryRunOnCurrentPlan), затем сохраняет и показывает план.
+   *
+   * Поля выставляются ДО refreshBranches() у обоих вызывающих (start()/resume()), а не здесь —
+   * refreshBranches() отправляет клиенту список веток вместе с this.selectedRefs НА МОМЕНТ вызова
+   * (см. sendBranchSlice → postBranches), и клиент заполняет чекбоксы только из ПЕРВОГО такого
+   * сообщения (см. selectionInitialized в releasePanel.ts). Если restore этого метода выставлял бы
+   * selectedRefs позже, первое сообщение уходило бы с пустым набором, и восстановленная хронология
+   * приходила бы без отмеченных чекбоксов веток.
+   */
+  private async finishApplyingPlan(): Promise<void> {
+    if (!this.plan) return;
+    if (this.plan.items.length === 0) {
+      this.persist();
+      if (this.isActive()) this.panel.postPlan(this.plan);
+      await this.loadReleaseBranchOwnCommits();
+      return;
+    }
+    try {
+      // Персистентный план — застывший снимок с прошлого раза; dev могла продолжить жить и
+      // смержить что-то уже ПОСЛЕ того, как план был сохранён (или план вообще сохранён более
+      // старой версией расширения, до появления mergeEventsByBranch, — тогда в JSON его просто
+      // нет). Пересчитываем его заново тем же дешёвым, уже закэшированным запросом, а не
+      // показываем как есть — иначе дорожка веток в хронологии может ошибочно показывать давно
+      // влитую ветку как всё ещё не влитую.
+      const { mainRef, mergeEvents } = await this.getRefsCache();
+      this.plan.mergeEventsByBranch = this.applyMergeEvents(this.plan.items, mergeEvents);
+      await this.syncAppliedFromReleaseBranch();
+      await this.syncAlreadyInMainFromCurrentState(mainRef);
+      // dryRunStatus/dryRunConflictFiles в снимке — тоже застывшие, с момента ПОСЛЕДНЕЙ сборки
+      // хронологии (возможно ещё до того, как что-либо было применено). Раз applied только что
+      // обновился по факту, старая dry-run информация для уже применённых пунктов не только
+      // устарела, но и заведомо неверна (см. runDryRunOnCurrentPlan/performDryRun — теперь
+      // пропускает applied-пункты и стартует от релизной, а не от основной ветки, если она есть).
+      await this.runDryRunOnCurrentPlan();
+    } catch {
+      // Мягкий отказ — план всё равно должен показаться, просто без обновлённых данных.
+    }
+    this.persist();
+    if (this.isActive()) this.panel.postPlan(this.plan);
+  }
+
+  /** "YYYY-MM-DD" на СЕГОДНЯ — тот же формат, что и клиентский todayIso() в releasePanel.ts, для formatReleaseBranch. */
+  private todayIso(): string {
+    const d = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  }
+
+  /** Имя релизной ветки, которое дало бы имя формата, если бы её создавали ПРЯМО СЕЙЧАС. */
+  private expectedReleaseBranchForToday(): string {
+    return formatReleaseBranch(this.config.releaseBranchPattern, this.todayIso());
+  }
+
+  /**
+   * Персистентное состояние для ЭТОГО репозитория, если оно есть и его релизная ветка реально
+   * существует — с разовой миграцией из старого (до v0.29) общего на всё расширение ключа: раньше
+   * состояние хранилось без привязки к репозиторию, и после того как ключ стал привязан к
+   * this.repoPath, старые данные иначе остались бы сиротой (новый код их просто не читает, а
+   * пользователь видел бы "релизная ветка еще не создана", хотя локально она уже есть и часть
+   * коммитов применена). Переносим только если releaseBranch из старого состояния реально
+   * существует В ЭТОМ репозитории — иначе это, скорее всего, состояние другого проекта из общего
+   * workspace, и присваивать его этому было бы неправильно.
+   */
+  private async findUsablePersistedState(): Promise<PersistedState | undefined> {
+    let state = this.context.workspaceState.get<PersistedState>(this.stateKey());
+    if (!state) {
+      const legacy = this.context.workspaceState.get<PersistedState>(STATE_KEY_PREFIX);
+      if (legacy?.releaseBranch && (await this.git.branchExists(legacy.releaseBranch))) {
+        state = legacy;
+        void this.context.workspaceState.update(this.stateKey(), legacy);
+        void this.context.workspaceState.update(STATE_KEY_PREFIX, undefined);
+      }
+    }
+    if (state?.releaseBranch && !(await this.git.branchExists(state.releaseBranch))) {
+      return undefined; // ветка удалена — состояние больше не актуально
+    }
+    return state;
+  }
+
+  /**
+   * Когда для найденной (по сегодняшней дате, см. expectedReleaseBranchForToday) релизной ветки НЕТ
+   * персистентного плана (например, ветку создали в версии расширения без сохранения состояния,
+   * или вручную, не через это расширение) — читаем её git-историю напрямую (см.
+   * GitService.releaseBranchOwnCommits) и показываем хотя бы то, что в ней реально уже есть, а не
+   * молча оставляем панель без единой подсказки, что сборка вообще начата.
+   */
+  private async loadReleaseBranchOwnCommits(): Promise<void> {
+    if (!this.releaseBranch) return;
+    try {
+      const mainRef = await this.resolveMainRef();
+      const commits = await this.git.releaseBranchOwnCommits(this.releaseBranch, mainRef, 200);
+      const withLinks = commits.map((c) => ({ ...c, ...this.buildLinks('', c.subject, c.sha, null) }));
+      if (this.isActive()) this.panel.postReleaseBranchInfo(this.releaseBranch, withLinks);
+    } catch {
+      // Мягкий отказ — необязательная подсказка, не должна ронять открытие панели.
     }
   }
 
@@ -608,6 +801,16 @@ export class ReleaseSession implements ReleasePanelHost {
    * ждали ensureClients+pruneWorktrees, и панель (даже пустая, с лоадером) не появлялась, пока они
    * не завершатся, из-за чего "Собрать релизную ветку" ощутимо не сразу реагировала на клик.
    * Список веток теперь приходит в уже открытую панель отдельным сообщением, как только будет готов.
+   *
+   * Восстанавливает сборку автоматически (даже если панель открыта обычным способом — 🚀 в
+   * "Проектах", а не отдельной командой "продолжить сборку") ТОЛЬКО если ТЕКУЩАЯ ветка репозитория
+   * (git.currentBranch()) сама и есть релизная ветка для СЕГОДНЯШНЕЙ даты (см.
+   * expectedReleaseBranchForToday). Специально не восстанавливаем по одному лишь факту "такая
+   * ветка где-то существует" — если пользователь сейчас на dev (или любой другой ветке), значит
+   * релизом прямо сейчас не занимается, и молчаливая подгрузка чужой хронологии только путает:
+   * непонятно, к какому состоянию репозитория она относится, раз рабочий каталог сейчас не на ней.
+   * Если персистентный план есть, но относится к ДРУГОЙ ветке (более старый релиз) — тоже не
+   * подходит, читаем историю текущей ветки напрямую (см. loadReleaseBranchOwnCommits).
    */
   async start(extensionUri: vscode.Uri, overrideConfig?: ReleaseConfig, projectContext?: PanelContext): Promise<void> {
     this.panel = ReleasePanel.createOrShow(extensionUri, this, projectContext);
@@ -617,14 +820,47 @@ export class ReleaseSession implements ReleasePanelHost {
       this.ready = true;
       await this.git.pruneWorktrees();
       await this.postCurrentBranch();
+
+      const currentBranchName = await this.git.currentBranch();
+      const expected = this.expectedReleaseBranchForToday();
+      let shouldFinishPlan = false;
+      if (currentBranchName === expected) {
+        const state = await this.findUsablePersistedState();
+        if (state && state.releaseBranch === expected) {
+          this.releaseBranch = state.releaseBranch;
+          this.selectedRefs = new Set(state.selectedRefs);
+          this.plan = state.plan ? { ...state.plan, releaseBranch: this.releaseBranch } : this.emptyPlanFor(this.releaseBranch);
+        } else {
+          // Нет персистентного плана именно для этой ветки (никто ничего не выбирал в ЭТОЙ
+          // сессии, или сохранённое состояние — про другой, более старый релиз) — но ветка реально
+          // есть и мы на ней, и клиент понимает "релиз создан" именно по currentPlan.releaseBranch
+          // (см. updateBuildButtonsState в releasePanel.ts), поэтому заводим ПУСТОЙ, но валидный
+          // план — как только пользователь выберет ветки и построит хронологию, rebuildPlan()
+          // полностью заменит его настоящим.
+          this.releaseBranch = expected;
+          this.plan = this.emptyPlanFor(expected);
+        }
+        shouldFinishPlan = true;
+      }
+
       await this.refreshBranches();
+
+      if (shouldFinishPlan) {
+        await this.finishApplyingPlan();
+      }
       await this.warnIfCherryPickInProgress();
     } catch (err: any) {
-      this.panel.postError(err?.message ?? String(err));
+      if (this.isActive()) this.panel.postError(err?.message ?? String(err));
     }
   }
 
-  /** Продолжение ранее начатой сборки (например, после перезапуска VS Code или конфликта). Панель открывается сразу — см. комментарий у start(). */
+  /**
+   * Продолжение ранее начатой сборки (например, после перезапуска VS Code или конфликта) —
+   * явная команда пользователя, поэтому, в отличие от start(), восстанавливает persisted-состояние
+   * независимо от того, на какой ветке сейчас репозиторий (пользователь мог переключиться на
+   * dev для другой задачи, не закончив релиз, и явно просит продолжить именно его). Панель
+   * открывается сразу — см. комментарий у start().
+   */
   async resume(extensionUri: vscode.Uri): Promise<void> {
     this.panel = ReleasePanel.createOrShow(extensionUri, this);
     try {
@@ -632,34 +868,22 @@ export class ReleaseSession implements ReleasePanelHost {
       this.ready = true;
       await this.git.pruneWorktrees();
 
-      const state = this.context.workspaceState.get<PersistedState>(STATE_KEY);
+      const state = await this.findUsablePersistedState();
       if (!state) {
-        throw new Error('Нет сохранённой сборки релиза — начните новую через "Qvarh Release: собрать релизную ветку".');
+        throw new Error(
+          'Нет сохранённой сборки релиза для этого репозитория (или её ветка больше не существует) — начните новую через "Qvarh Release: собрать релизную ветку".'
+        );
       }
       this.releaseBranch = state.releaseBranch;
       this.selectedRefs = new Set(state.selectedRefs);
-      this.plan = state.plan;
+      this.plan = state.plan ? { ...state.plan, releaseBranch: this.releaseBranch } : this.emptyPlanFor(this.releaseBranch);
 
       await this.postCurrentBranch();
       await this.refreshBranches();
-      if (this.plan) {
-        // Персистентный план — застывший снимок с прошлого раза; dev могла продолжить жить и
-        // смержить что-то уже ПОСЛЕ того, как план был сохранён (или план вообще сохранён более
-        // старой версией расширения, до появления mergeEventsByBranch, — тогда в JSON его просто
-        // нет). Пересчитываем его заново тем же дешёвым, уже закэшированным запросом, а не
-        // показываем как есть — иначе дорожка веток в хронологии может ошибочно показывать давно
-        // влитую ветку как всё ещё не влитую.
-        try {
-          const { mergeEvents } = await this.getRefsCache();
-          this.plan.mergeEventsByBranch = this.applyMergeEvents(this.plan.items, mergeEvents);
-        } catch {
-          // Мягкий отказ — план всё равно должен показаться, просто без обновлённых данных о слиянии.
-        }
-        this.panel.postPlan(this.plan);
-      }
+      await this.finishApplyingPlan();
       await this.warnIfCherryPickInProgress();
     } catch (err: any) {
-      this.panel.postError(err?.message ?? String(err));
+      if (this.isActive()) this.panel.postError(err?.message ?? String(err));
     }
   }
 
@@ -709,8 +933,10 @@ export class ReleaseSession implements ReleasePanelHost {
       for (const commit of commits) {
         Object.assign(commit, this.buildLinks(branch.name, commit.subject, commit.sha, null));
       }
+      if (!this.isActive()) return;
       this.panel.postBranchCommits(ref, commits, truncated, forkedFrom ?? null);
     } catch (err: any) {
+      if (!this.isActive()) return;
       this.panel.postBranchCommits(ref, [], false);
       this.panel.postError(`Не удалось получить коммиты ветки ${branch.name}: ${err?.message ?? err}`);
     }
@@ -787,7 +1013,7 @@ export class ReleaseSession implements ReleasePanelHost {
     } catch {
       hints = [];
     }
-    if (generation !== this.planGeneration) return;
+    if (generation !== this.planGeneration || !this.isActive()) return;
     const withLinks = hints.map((h) => ({ ...h, ...this.buildLinks(h.branch, h.subject, h.sha, null) }));
     this.panel.postStaleBranches(withLinks);
   }
@@ -849,7 +1075,14 @@ export class ReleaseSession implements ReleasePanelHost {
    */
   private async runDryRunOnCurrentPlan(): Promise<void> {
     if (!this.plan || this.plan.items.length === 0) return;
-    const outcome = await performDryRun(this.git, this.plan.mainBranch, this.plan.items);
+    // Если релизная ветка уже реально существует — симулируем оставшиеся (ещё не applied, см.
+    // performDryRun) пункты ОТ НЕЁ, а не от основной ветки: она уже содержит всё, что применено на
+    // самом деле, и именно это состояние реально будет при следующем "Начать сборку". Симуляция от
+    // main вместо этого — источник ложных конфликтов для контента, который уже применён и никакого
+    // конфликта на самом деле не вызовет (см. performDryRun).
+    const baseRef =
+      this.releaseBranch && (await this.git.branchExists(this.releaseBranch)) ? this.releaseBranch : this.plan.mainBranch;
+    const outcome = await performDryRun(this.git, baseRef, this.plan.items);
 
     const bySha = new Map(outcome.results.map((r) => [r.sha, r] as const));
     for (const item of this.plan.items) {
@@ -884,6 +1117,23 @@ export class ReleaseSession implements ReleasePanelHost {
   }
 
   /** Реально создаёт (или переиспользует) релизную ветку от основной — только на этом шаге нужна дата. */
+  /**
+   * Клиент шлёт это при загрузке панели и на каждое изменение поля "Дата релиза" (см.
+   * releasePanel.ts) — дёшево: просто сверяет введённую дату с уже загруженным this.fullBranches
+   * (без нового git-вызова), чтобы дизейблить "Создать релизную ветку", когда ветка с таким именем
+   * уже существует (нет смысла создавать — нужно продолжать сборку уже имеющейся).
+   */
+  async onCheckReleaseDate(releaseDate: string): Promise<void> {
+    if (!this.isActive()) return;
+    if (!releaseDate) {
+      this.panel.postReleaseDateCheck('', false);
+      return;
+    }
+    const branchName = formatReleaseBranch(this.config.releaseBranchPattern, releaseDate);
+    const exists = this.fullBranches.some((b) => b.name === branchName);
+    this.panel.postReleaseDateCheck(branchName, exists);
+  }
+
   async onStartBuilding(releaseDate: string): Promise<void> {
     if (!this.plan) throw new Error('Сначала постройте хронологию.');
     if (!releaseDate) throw new Error('Укажите дату релиза — она используется в имени релизной ветки.');
@@ -902,37 +1152,29 @@ export class ReleaseSession implements ReleasePanelHost {
     this.plan.releaseBranch = this.releaseBranch;
     this.persist();
     await this.postCurrentBranch();
+    if (!this.isActive()) return;
     this.panel.postPlan(this.plan);
   }
 
+  /**
+   * Единственный способ применения плана — "Начать сборку" (applyAll: всё подряд до первого
+   * конфликта или до конца). Повторный клик после конфликта сам продолжает с того же места, если
+   * конфликт уже разрешён в рабочем каталоге (см. applyNextItem в executor.ts) — отдельных кнопок
+   * "Следующий шаг"/"Продолжить после конфликта"/"Пропустить конфликтующий пункт" больше нет:
+   * пошаговое применение только замедляло тот же самый механизм, а "пропустить" эквивалентно
+   * "Отменить сборку" + снять чекбокс с пункта + запустить сборку снова.
+   *
+   * applyAll реально выполняет cherry-pick в репозитории — переключение на другой проект его НЕ
+   * прерывает (наполовину применённая сборка релиза — гораздо хуже, чем просто не увидеть её
+   * прогресс), поэтому здесь isActive() гасит только пост в панель на каждом шаге, а не сам цикл
+   * применения.
+   */
   async onStartAuto(): Promise<void> {
     if (!this.plan?.releaseBranch) throw new Error('Сначала создайте релизную ветку.');
     await applyAll(this.git, this.plan, (ev) => {
       this.persist();
-      this.panel.postProgress(ev);
+      if (this.isActive()) this.panel.postProgress(ev);
     });
-  }
-
-  async onStepNext(): Promise<void> {
-    if (!this.plan?.releaseBranch) throw new Error('Сначала создайте релизную ветку.');
-    await applyNextItem(this.git, this.plan, (ev) => {
-      this.persist();
-      this.panel.postProgress(ev);
-    });
-  }
-
-  async onContinueConflict(): Promise<void> {
-    if (!this.plan) return;
-    await resolveConflictAndContinue(this.git, this.plan);
-    this.persist();
-    this.panel.postPlan(this.plan);
-  }
-
-  async onSkipConflict(): Promise<void> {
-    if (!this.plan) return;
-    await skipConflictingItem(this.git, this.plan);
-    this.persist();
-    this.panel.postPlan(this.plan);
   }
 
   /** Аварийный выход: полностью отменяет незавершённый cherry-pick (git cherry-pick --abort). */
@@ -941,6 +1183,15 @@ export class ReleaseSession implements ReleasePanelHost {
       await this.git.cherryPickAbort();
     }
     await this.postCurrentBranch();
+    if (!this.isActive()) return;
     this.panel.postError('');
+  }
+
+  /** Публикует уже полностью собранную релизную ветку в remote (git push -u). */
+  async onPublishRelease(): Promise<void> {
+    if (!this.plan?.releaseBranch) throw new Error('Сначала соберите релиз.');
+    await this.git.pushBranch(this.config.remoteName, this.plan.releaseBranch);
+    if (!this.isActive()) return;
+    this.panel.postPublished();
   }
 }

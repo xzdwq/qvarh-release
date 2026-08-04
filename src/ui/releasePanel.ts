@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { BranchRef, CommitInfo, MainStatus, ReleasePlan, StaleBranchHint } from '../core/types';
+import { BranchCommitInfo, BranchDiffStat, BranchRef, MainStatus, ReleasePlan, StaleBranchHint } from '../core/types';
 import { ExecutorEvent } from '../core/executor';
 
 export interface BranchListInfo {
@@ -21,11 +21,10 @@ export interface ReleasePanelHost {
   onClearPlan(): Promise<void>;
   onToggleItem(sha: string, included: boolean): Promise<void>;
   onStartBuilding(releaseDate: string): Promise<void>;
+  onCheckReleaseDate(releaseDate: string): Promise<void>;
   onStartAuto(): Promise<void>;
-  onStepNext(): Promise<void>;
-  onContinueConflict(): Promise<void>;
-  onSkipConflict(): Promise<void>;
   onAbortBuild(): Promise<void>;
+  onPublishRelease(): Promise<void>;
   onSetStaleBranchesLookback(n: number): Promise<void>;
 }
 
@@ -77,6 +76,20 @@ export class ReleasePanel {
     return ReleasePanel.current;
   }
 
+  /**
+   * Панель — синглтон, переиспользуемый между проектами (см. createOrShow), а host каждый раз
+   * ПЕРЕЗАПИСЫВАЕТСЯ на новую ReleaseSession, без ожидания завершения предыдущей. Если старая
+   * ReleaseSession в этот момент ещё дожидается своих же git-вызовов (например, самый первый
+   * refreshBranches() в start(), который может идти секунды на большом репозитории) и слепо зовёт
+   * this.panel.postXxx(...) по их завершении — результат всё равно уйдёт в ЭТУ ЖЕ панель, но она
+   * уже показывает ДРУГОЙ проект: список веток/фильтр предыдущего проекта на секунду (или навсегда)
+   * "всплывают" поверх уже переключённого. ReleaseSession должна звать это ПЕРЕД каждым post-вызовом,
+   * который идёт после await, и тихо пропускать отправку, если она больше не хозяин панели.
+   */
+  isCurrentHost(host: ReleasePanelHost): boolean {
+    return this.host === host;
+  }
+
   private constructor(panel: vscode.WebviewPanel, private host: ReleasePanelHost, private readonly extensionUri: vscode.Uri) {
     this.panel = panel;
     this.panel.webview.html = this.renderHtml();
@@ -117,20 +130,17 @@ export class ReleasePanel {
             case 'startBuilding':
               await this.host.onStartBuilding(message.releaseDate);
               break;
+            case 'checkReleaseDate':
+              await this.host.onCheckReleaseDate(message.releaseDate);
+              break;
             case 'startAuto':
               await this.host.onStartAuto();
               break;
-            case 'stepNext':
-              await this.host.onStepNext();
-              break;
-            case 'continueConflict':
-              await this.host.onContinueConflict();
-              break;
-            case 'skipConflict':
-              await this.host.onSkipConflict();
-              break;
             case 'abortBuild':
               await this.host.onAbortBuild();
+              break;
+            case 'publishRelease':
+              await this.host.onPublishRelease();
               break;
             case 'setStaleBranchesLookback':
               await this.host.onSetStaleBranchesLookback(message.value);
@@ -149,11 +159,34 @@ export class ReleasePanel {
     this.panel.webview.postMessage({ command: 'currentBranch', current, mainBranch, devBranch, staleBranchesLookbackReleases });
   }
 
+  /**
+   * Задачи, которые реально уже есть в найденной релизной ветке (см. session.ts
+   * loadReleaseBranchOwnCommits) — только для случая, когда ветка найдена (по имени/дате), но нет
+   * персистентного плана с полной хронологией (например, ветку создали в старой версии расширения
+   * или вручную) — иначе панель ничем не подтвердила бы пользователю, что сборка уже начата.
+   */
+  postReleaseBranchInfo(
+    releaseBranch: string,
+    commits: Array<{ sha: string; subject: string; authorDate: string; authorName: string; taskUrl: string | null; prUrl: string | null; commitUrl: string | null }>
+  ): void {
+    this.panel.webview.postMessage({ command: 'releaseBranchInfo', releaseBranch, commits });
+  }
+
+  /** Сколько веток в репозитории подходят под шаблон релизной ветки — общая картина наверху панели, см. session.ts postReleaseBranchPatternCount. */
+  postReleaseBranchPatternCount(count: number): void {
+    this.panel.webview.postMessage({ command: 'releaseBranchPatternCount', count });
+  }
+
+  /** Ответ на 'checkReleaseDate' — есть ли уже релизная ветка с именем, которое дала бы введённая дата (см. session.ts onCheckReleaseDate). Панель по этому ответу дизейблит/включает "Создать релизную ветку". */
+  postReleaseDateCheck(branchName: string, exists: boolean): void {
+    this.panel.webview.postMessage({ command: 'releaseDateCheck', branchName, exists });
+  }
+
   postBranches(branches: BranchRef[], selectedRefs: string[], info: BranchListInfo): void {
     this.panel.webview.postMessage({ command: 'branches', branches, selectedRefs, info });
   }
 
-  postBranchCommits(ref: string, commits: CommitInfo[], truncated: boolean, forkedFrom: string | null = null): void {
+  postBranchCommits(ref: string, commits: BranchCommitInfo[], truncated: boolean, forkedFrom: string | null = null): void {
     this.panel.webview.postMessage({ command: 'branchCommits', ref, commits, truncated, forkedFrom });
   }
 
@@ -172,12 +205,21 @@ export class ReleasePanel {
     this.panel.webview.postMessage({ command: 'branchMainStatus', statusByRef });
   }
 
+  /** Агрегированный +/- и число файлов на ветку (превью без разворачивания коммитов) — тем же фоновым проходом, что и postBranchMainStatus, см. computeMainStatusForBranches в planner.ts. */
+  postBranchDiffStats(diffStatByRef: Record<string, BranchDiffStat>): void {
+    this.panel.webview.postMessage({ command: 'branchDiffStats', diffStatByRef });
+  }
+
   postPlan(plan: ReleasePlan | null): void {
     this.panel.webview.postMessage({ command: 'planBuilt', plan });
   }
 
   postProgress(event: ExecutorEvent): void {
     this.panel.webview.postMessage({ command: 'progress', event });
+  }
+
+  postPublished(): void {
+    this.panel.webview.postMessage({ command: 'published' });
   }
 
   postError(message: string): void {
@@ -216,9 +258,15 @@ export class ReleasePanel {
   button.link { background: none; color: var(--vscode-textLink-foreground); padding: 0; margin: 0; text-decoration: underline; font-size: 11px; }
   .links a { color: var(--vscode-textLink-foreground); text-decoration: none; margin-right: 8px; font-size: 11px; }
   .links a:hover { text-decoration: underline; }
+  /* Цвет +/- один на все контексты, где рендерится renderDiffStatInline (ссылки, автор в хронологии,
+     суммаризация внизу таблицы) — раньше был задан отдельно под каждым родительским классом и до
+     суммаризации просто не добрался (см. .chrono-summary-row ниже), из-за чего там +/- были обычным
+     текстом без цвета. Layout (расположение в строку/столбик, отступы, моноширинный шрифт) остаётся
+     свой у каждого контекста — общий только цвет. */
+  .diffstat-add { color: var(--vscode-charts-green); }
+  .diffstat-del { color: var(--vscode-charts-red); }
   .links .diffstat { font-size: 11px; font-family: var(--vscode-editor-font-family, monospace); }
-  .links .diffstat-add { color: var(--vscode-charts-green); }
-  .links .diffstat-del { color: var(--vscode-charts-red); margin-left: 4px; }
+  .links .diffstat-del { margin-left: 4px; }
   button:disabled { opacity: 0.5; cursor: default; }
   #branchList { height: 280px; min-height: 120px; resize: vertical; overflow-y: auto; overflow-x: hidden; border: 1px solid var(--vscode-panel-border); padding: 4px; margin-top: 6px; }
   .branch-row { padding: 3px 0; border-bottom: 1px dashed var(--vscode-panel-border); }
@@ -226,8 +274,7 @@ export class ReleasePanel {
   .branch-row.remote .branch-name::after { content: " (remote)"; opacity: 0.5; font-size: 10px; }
   .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; margin-top: 3px; }
   .lane-label { font-size: 11px; padding: 1px 6px; border-radius: 3px; color: #000; flex: none; min-width: 90px; text-align: center; }
-  .item-row { display: flex; align-items: flex-start; gap: 8px; padding: 3px 0; border-bottom: 1px dashed var(--vscode-panel-border); }
-  .item-main, .branch-main { flex: 1; }
+  .branch-main { flex: 1; }
   .sha { font-family: var(--vscode-editor-font-family); font-size: 11px; opacity: 0.8; }
   .muted { opacity: 0.7; font-size: 12px; }
   .badge { font-size: 11px; padding: 1px 6px; border-radius: 3px; margin-right: 4px; display: inline-block; margin-top: 2px; }
@@ -238,7 +285,6 @@ export class ReleasePanel {
   .badge.inmain { background: var(--vscode-charts-purple, #B37FEB); color: #000; }
   .badge.partial-inmain { background: var(--vscode-charts-yellow, #E2C08D); color: #000; }
   .chip { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); margin: 2px 4px 2px 0; }
-  .mode-toggle label { margin-right: 14px; }
   #error { display: flex; align-items: flex-start; gap: 8px; color: var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); border: 1px solid var(--vscode-inputValidation-errorBorder, transparent); padding: 6px; border-radius: 3px; min-height: 1em; }
   #errorText { white-space: pre-wrap; flex: 1; }
   #errorCloseBtn { background: none; border: none; color: inherit; cursor: pointer; padding: 0; margin: 0; font-size: 14px; line-height: 1; opacity: 0.7; }
@@ -266,20 +312,64 @@ export class ReleasePanel {
   .section-header { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
   .section-header .collapse-arrow { font-size: 10px; opacity: 0.7; width: 10px; display: inline-block; }
   .collapsible-body.collapsed { display: none; }
-  .context-row { display: flex; align-items: flex-start; gap: 8px; padding: 2px 0; opacity: 0.55; font-size: 11px; }
-  .context-row .lane-label { background: transparent !important; color: var(--vscode-foreground) !important; border: 1px dashed var(--vscode-panel-border); min-width: 90px; }
   /* "Rail" — дорожки веток слева от хронологии (см. renderItems/computeRail/drawRail): dev-"ствол"
      (лейн 0) и по одной дорожке на каждую показанную ветку, шириной RAIL_LANE_W каждая — фиксированный
      размер, не зависящий от ширины панели (поэтому не "разъезжается" на широком экране, в отличие от
      прежнего варианта на @gitgraph/js). Сами линии/точки/кривые ветвления-слияния рисуются ОДНИМ SVG
-     поверх колонки-заглушки (.rail-spacer лишь резервирует горизонтальное место в каждой строке) —
-     координаты по Y берутся из РЕАЛЬНОГО отрендеренного положения строк (см. measureRowCenters), а
-     не подгоняются под фиксированную высоту, поэтому переносы текста в теме коммита не ломают линии. */
-  #items { position: relative; margin-top: 4px; }
-  .timeline-row { display: flex; align-items: stretch; border-bottom: 1px dashed var(--vscode-panel-border); }
+     поверх колонки-заглушки (.rail-spacer лишь резервирует горизонтальное место в каждой строке, теперь
+     через CSS-переменную --rail-w — первый трек .chrono-grid-row, а не инлайновый style как раньше) —
+     координаты по Y берутся из РЕАЛЬНОГО отрендеренного положения строк (см. drawRailNow: offsetTop/
+     offsetHeight каждого .timeline-row), а не подгоняются под фиксированную высоту, поэтому переносы
+     текста в колонке коммита (см. .chrono-grid-row) не ломают линии — ResizeObserver перерисовывает
+     дорожку при любом изменении высоты строк, в т.ч. из-за ресайза окна. */
+  #items { position: relative; }
+  /* overflow-y без явного значения тут был БЫ не "visible", как можно подумать по тексту правила —
+     по спеке CSS, если overflow-x задан НЕ visible, а overflow-y не указан, второй тоже вычисляется
+     как auto, а не остаётся visible. У #items внутри лежит абсолютно позиционированный SVG-оверлей
+     графа с overflow:visible (пунктирные "хвосты" веток намеренно на пару пикселей выходят за его
+     верхний/нижний край, см. drawRail) — этот paint-overflow попадал в скроллируемую область
+     .chrono-scroll и добавлял пустое место снизу таблицы вместе с ненужным вертикальным скроллом.
+     overflow-y: hidden — явно отключает вертикальный скролл у этого контейнера (нужен только
+     горизонтальный, см. min-width на #chronoInner), не влияя на видимость самой таблицы: её реальная
+     высота и так равна высоте содержимого. */
+  .chrono-scroll { overflow-x: auto; overflow-y: hidden; margin-top: 4px; }
+  .timeline-row { border-bottom: 1px dashed var(--vscode-panel-border); }
   .timeline-row:last-child { border-bottom: none; }
-  .timeline-row .item-row, .timeline-row .context-row { border-bottom: none; flex: 1; min-width: 0; }
-  .rail-spacer { flex: none; }
+  .timeline-row.timeline-row-hidden { min-height: 0; border-bottom: none; }
+  /* Каждая "строка таблицы" хронологии (заголовок, .timeline-row коммита/контекста, футер-суммаризация
+     ниже) — свой display:grid с ОДИНАКОВЫМ grid-template-columns, поэтому колонки визуально совпадают
+     без единого общего grid-контейнера на все строки сразу (а значит без риска для rowCenters — каждый
+     .timeline-row остаётся ровно одним элементом, как и раньше, просто теперь grid, а не flex внутри).
+     Первая колонка — ширина графа (--rail-w, пишется в renderItems из railWidth(rail)); дальше:
+     чекбокс+ветка (фиксированная — под .lane-label) · коммит (единственная гибкая, minmax(...,1fr) —
+     именно она переносит текст при ресайзе, сужена — горизонтальный скролл при необходимости и так
+     есть, растягивать эту колонку сверх нужного незачем) · дата · автор (второй строкой — +/-, см.
+     renderItemRow; отдельной колонки "Изменения" больше нет). */
+  .chrono-grid-row { display: grid; grid-template-columns: var(--rail-w, 18px) 152px minmax(160px, 1fr) 144px 124px; column-gap: 0; align-items: stretch; }
+  .chrono-cell { padding: 3px 8px; min-width: 0; }
+  .chrono-header-row { border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 4px; margin-bottom: 2px; }
+  .chrono-header-cell { font-weight: 600; font-size: 11px; opacity: 0.75; text-transform: uppercase; letter-spacing: 0.02em; }
+  .col-branch { display: flex; align-items: flex-start; gap: 6px; }
+  /* Длинные имена веток (feature/very-long-task-name) переносятся на несколько строк, а не режутся
+     эллипсисом — само имя ветки важно видеть целиком, а не только начало. Раньше .lane-label здесь
+     наследовал flex:none/white-space:nowrap от базового правила (см. .lane-label — оно используется
+     и для чипов в списке веток, где перенос не нужен) — из-за flex-shrink:0 чип не мог сжаться под
+     ширину .chrono-cell и визуально наезжал на соседнюю колонку с коммитом, а не переносился внутри
+     своей. min-width:0 обязателен — без него flex-item по умолчанию не может стать уже своего
+     содержимого, и wrap так и не сработал бы. Высота строки при этом не фиксирована (см. .chrono-cell)
+     — многострочная ветка просто раздвигает всю строку, как уже делает перенос темы коммита. */
+  .col-branch .lane-label { flex: 1 1 auto; min-width: 0; white-space: normal; overflow-wrap: break-word; word-break: break-word; }
+  .col-date { font-family: var(--vscode-editor-font-family); font-size: 11px; opacity: 0.8; white-space: nowrap; }
+  .col-author { font-size: 11px; opacity: 0.8; }
+  .col-author > div:first-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .col-author .diffstat { display: flex; gap: 4px; margin-top: 2px; font-family: var(--vscode-editor-font-family, monospace); }
+  /* Контекстные/якорные коммиты dev-ветки — фон хронологии, не относятся ни к одной выбранной ветке:
+     нет чекбокса, нет +/- (у CommitInfo нет insertions/deletions), приглушены визуально. */
+  .timeline-row.chrono-context { opacity: 0.55; font-size: 11px; }
+  .chrono-context .lane-label { background: transparent !important; color: var(--vscode-foreground) !important; border: 1px dashed var(--vscode-panel-border); }
+  .chrono-summary-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin-top: 6px; padding: 6px 8px; border-top: 1px solid var(--vscode-panel-border); font-size: 11px; opacity: 0.85; }
+  .chrono-summary-row .diffstat { display: inline-flex; gap: 4px; }
+  .chrono-summary-sep { opacity: 0.5; margin: 0 2px; }
   /* Невидимый маркер слияния при свёрнутых контекстных коммитах (см. renderItems) — нулевая высота
      и без разделителя, чтобы визуально ничем не отличаться от "полностью скрыто", но всё ещё
      присутствовать в DOM ради Y-координаты для кривой слияния на дорожке. */
@@ -320,7 +410,7 @@ export class ReleasePanel {
     <img src="${logoUri}" alt="" />
     <h2>Qvarh Release Builder</h2>
   </div>
-  <div class="muted" style="margin-bottom:10px;">Git local: локальный релиз по выбранным коммитам</div>
+  <div class="muted" style="margin-bottom:10px;">Git: локальный релиз по выбранным коммитам</div>
 
   <div id="error" style="display:none;">
     <span id="errorText"></span>
@@ -328,7 +418,6 @@ export class ReleasePanel {
   </div>
 
   <section>
-    <h3>Git</h3>
     <div class="git-status">
       <div>Текущая ветка: <b id="currentBranchName">…</b></div>
       <div>Основная ветка (для релиза): <b id="mainBranchName">…</b></div>
@@ -355,6 +444,9 @@ export class ReleasePanel {
       <button id="branchListLimitBtn" class="secondary" title="Применяет флажок «Скрыть в main» и лимит показа вместе">Применить</button>
     </div>
     <div id="branchListInfo" class="muted">Загрузка списка веток…</div>
+    <label style="display:inline-block; margin:4px 0;" title="Выбирает/снимает выбор со всех веток, показанных ниже — то есть с учётом текущего фильтра, а не вообще всех веток репозитория">
+      <input type="checkbox" id="selectAllVisibleBranches" /> Выбрать все
+    </label>
     <div id="branchList"><div class="muted branch-list-loading">Загрузка веток…</div></div>
     <div id="selectedSummary" class="muted" style="margin-top:6px;"></div>
 
@@ -375,7 +467,19 @@ export class ReleasePanel {
         <button id="toggleContextBtn" class="link" style="display:none;"></button>
       </div>
       <div id="staleBranches" class="stale-branches"></div>
-      <div id="items"></div>
+      <div id="chronoScroll" class="chrono-scroll">
+        <div id="chronoInner" class="chrono-inner">
+          <div id="chronoHeaderRow" class="chrono-header-row chrono-grid-row" style="display:none;">
+            <div class="rail-spacer"></div>
+            <div class="chrono-cell chrono-header-cell">Ветка</div>
+            <div class="chrono-cell chrono-header-cell">Коммит</div>
+            <div class="chrono-cell chrono-header-cell">Дата</div>
+            <div class="chrono-cell chrono-header-cell">Автор</div>
+          </div>
+          <div id="items"></div>
+          <div id="chronoSummaryRow" class="chrono-summary-row"></div>
+        </div>
+      </div>
       <div id="cherryPickSection" class="cherry-pick-section" style="display:none;">
         <div class="section-header-static">
           <h4 style="margin:0;">Команда для ручного cherry-pick</h4>
@@ -400,17 +504,18 @@ export class ReleasePanel {
       <button id="createBranchBtn">Создать релизную ветку</button>
       <span class="muted" id="releaseBranchStatus"></span>
     </div>
+    <div class="muted" id="releaseBranchInfo"></div>
 
-    <div class="mode-toggle" style="margin-top:10px;">
-      <label><input type="radio" name="mode" value="auto" checked /> Авто (всё подряд до первого конфликта)</label>
-      <label><input type="radio" name="mode" value="manual" /> Пошагово вручную</label>
+    <div class="muted" style="margin-top:10px;">
+      «Начать сборку» применяет отмеченные коммиты (cherry-pick) один за другим в хронологическом порядке, пока не закончит или не встретит конфликт. Если возник конфликт — разрешите его в файлах репозитория (как обычный конфликт merge/rebase) и нажмите «Начать сборку» ещё раз: сборка сама продолжит с того же места, отдельной кнопки для этого не нужно.
     </div>
-    <div class="button-row">
+    <div class="button-row" style="margin-top:4px;">
       <button id="startBtn" disabled>Начать сборку</button>
-      <button id="stepBtn" class="secondary" disabled>Следующий шаг</button>
-      <button id="continueBtn" class="secondary">Продолжить после конфликта</button>
-      <button id="skipBtn" class="secondary">Пропустить конфликтующий пункт</button>
       <button id="abortBtn" class="secondary">Отменить сборку (cherry-pick --abort)</button>
+    </div>
+    <div id="buildStatus" class="muted" style="margin-top:4px;"></div>
+    <div class="button-row" id="publishRow" style="display:none; margin-top:10px;">
+      <button id="publishBtn">Опубликовать релизную ветку</button>
     </div>
   </section>
 
@@ -423,6 +528,7 @@ export class ReleasePanel {
   let configMainBranch = 'main';
   let configDevBranch = 'dev';
   let staleBranchesLookbackReleases = 4;
+  let releaseBranchPatternCount = null;
   let lastStaleHints = null;
   let currentBranches = [];
   let selectedRefs = new Set();
@@ -441,6 +547,11 @@ export class ReleasePanel {
   // здесь уже видно ПО КАЖДОМУ коммиту, попал он в main или нет, поэтому можно отличить "частично"
   // от "полностью". До разворачивания используется приблизительный b.mainStatus с сервера (см. MainStatus в types.ts).
   const branchMainStatusOverride = new Map();
+  // Агрегированный +/- и число файлов на ветку целиком (см. BranchDiffStat в types.ts) — досчитывается
+  // в фоне тем же проходом, что и точный статус "в main" (см. session.ts refineBranchMainStatus/
+  // computeMainStatusForBranches), приходит позже самого списка веток, поэтому до первого такого
+  // сообщения строки списка это просто не показывают (renderDiffStatInline вернёт '' без записи здесь).
+  const branchDiffStatByRef = new Map();
 
   // Цвет назначается ПОСЛЕДОВАТЕЛЬНО, в порядке первого обращения (а не хэшем от имени) — так
   // соседние по времени/лейну ветки почти всегда получают максимально разнесённые оттенки. Шаг в
@@ -468,28 +579,40 @@ export class ReleasePanel {
     return branchMainStatusOverride.get(ref) || fallback;
   }
 
-  // "+N"/"-M" числа изменённых строк (см. PlanItem.insertions/deletions) — в конце той же строки,
-  // где ссылки на задачу/PR/коммит, а не прямо на графе: там при узком лейне (18px) и мелком шрифте
-  // текст пришлось разворачивать вертикально в разные стороны для "+" и "-", и прочитать его было
-  // практически невозможно. У context/anchor-коммитов (CommitInfo, не PlanItem) этих полей нет —
-  // для них просто ничего не рендерится.
+  // "+N"/"-M" числа изменённых строк (см. PlanItem.insertions/deletions). Раньше рисовались прямо на
+  // графе (вертикальным текстом вдоль дорожки ветки) — при мелком шрифте и развороте в разные стороны
+  // у "+" и "-" читать их было практически невозможно; сейчас у коммитов выбранных веток это отдельная
+  // колонка .col-changes (см. renderItemRow), а не часть строки со ссылками. У context/anchor-коммитов
+  // (CommitInfo, не PlanItem) полей insertions/deletions нет — для них рендерится пустая строка.
   function renderDiffStatInline(entity) {
     const insertions = entity.insertions || 0;
     const deletions = entity.deletions || 0;
-    if (!insertions && !deletions) return '';
+    // filesChanged — только у агрегированной сводки по ветке целиком (см. branchDiffStatByRef/
+    // BranchDiffStat в types.ts), у отдельного коммита (PlanItem/BranchCommitInfo) этого поля нет
+    // и не будет — там же и так виден список конкретных файлов при разворачивании.
+    const filesChanged = entity.filesChanged || 0;
+    if (!insertions && !deletions && !filesChanged) return '';
     let out = '<span class="diffstat">';
     if (insertions) out += \`<span class="diffstat-add">+\${formatDiffCount(insertions)}</span>\`;
     if (deletions) out += \`<span class="diffstat-del">-\${formatDiffCount(deletions)}</span>\`;
-    return out + '</span>';
+    out += '</span>';
+    if (filesChanged) out += \` <span class="muted">(\${filesChanged} файл(ов))</span>\`;
+    return out;
   }
 
-  function renderLinks(entity) {
+  // includeDiffStat=false — у коммитов выбранных веток (renderItemRow) диффstat теперь в СВОЕЙ колонке
+  // .col-changes, поэтому здесь он лишний; у context/anchor-строк (нет своей колонки изменений — там
+  // просто пустая ячейка, см. .col-changes в renderContextRow/renderAnchorRow) остаётся дефолт true,
+  // хотя renderDiffStatInline для них и так вернёт '' (у CommitInfo нет insertions/deletions).
+  function renderLinks(entity, includeDiffStat = true) {
     const links = [];
     if (entity.taskUrl) links.push(\`<a href="\${entity.taskUrl}" target="_blank" rel="noopener">Задача</a>\`);
     if (entity.prUrl) links.push(\`<a href="\${entity.prUrl}" target="_blank" rel="noopener">PR #\${entity.prNumber}</a>\`);
     if (entity.commitUrl) links.push(\`<a href="\${entity.commitUrl}" target="_blank" rel="noopener">коммит</a>\`);
-    const diffStat = renderDiffStatInline(entity);
-    if (diffStat) links.push(diffStat);
+    if (includeDiffStat) {
+      const diffStat = renderDiffStatInline(entity);
+      if (diffStat) links.push(diffStat);
+    }
     return links.length ? \`<div class="links">\${links.join('')}</div>\` : '';
   }
 
@@ -521,6 +644,21 @@ export class ReleasePanel {
   }
   document.getElementById('releaseDate').value = todayIso();
 
+  // Дизейблит "Создать релизную ветку", если ветка с именем для введённой даты уже существует
+  // (см. session.ts onCheckReleaseDate/postReleaseDateCheck) — нет смысла создавать повторно,
+  // нужно продолжать сборку уже имеющейся. Дебаунс — чтобы не слать сообщение на каждую нажатую
+  // клавишу при вводе даты вручную.
+  let releaseDateCheckDebounce = null;
+  function requestReleaseDateCheck() {
+    const value = document.getElementById('releaseDate').value.trim();
+    vscode.postMessage({ command: 'checkReleaseDate', releaseDate: value });
+  }
+  document.getElementById('releaseDate').addEventListener('input', () => {
+    clearTimeout(releaseDateCheckDebounce);
+    releaseDateCheckDebounce = setTimeout(requestReleaseDateCheck, 200);
+  });
+  requestReleaseDateCheck();
+
   function deselectBranch(ref) {
     selectedRefs.delete(ref);
     updateSelectedSummary();
@@ -547,7 +685,7 @@ export class ReleasePanel {
 
   function renderBranchCommits(ref) {
     const entry = branchCommitsCache.get(ref);
-    if (entry === 'loading') return '<div class="branch-commits muted">Загрузка коммитов…</div>';
+    if (entry === 'loading') return '<div class="branch-commits muted inline-loading">Загрузка коммитов…</div>';
     if (!entry) return '';
     const { commits, truncated, forkedFrom } = entry;
     const forkedFromNote = forkedFrom
@@ -569,6 +707,10 @@ export class ReleasePanel {
     el.innerHTML = currentBranches.map((b) => {
       const expanded = expandedRefs.has(b.ref);
       const status = effectiveMainStatus(b.ref, b.mainStatus);
+      // Агрегированный diffstat досчитывается фоном ПОСЛЕ самого списка (см. branchDiffStatByRef
+      // выше) — сливаем в отдельный объект для renderLinks, а не мутируем b из currentBranches.
+      const diffStat = branchDiffStatByRef.get(b.ref);
+      const linksEntity = diffStat ? Object.assign({}, b, diffStat) : b;
       return \`
       <div class="branch-row \${b.isRemote ? 'remote' : ''}">
         <div class="branch-row-main">
@@ -577,7 +719,7 @@ export class ReleasePanel {
           <div class="branch-main">
             <div><span class="branch-name">\${b.name}</span> \${mainStatusBadge(status)}</div>
             <div class="muted sha">\${b.lastCommitSha ? b.lastCommitSha.slice(0,8) : ''} · \${formatDate(b.lastCommitDate)} · \${b.lastCommitAuthor} · \${b.lastCommitSubject}</div>
-            \${renderLinks(b)}
+            \${renderLinks(linksEntity)}
             <button class="link expand-toggle" data-ref="\${b.ref}">\${expanded ? '▾ скрыть коммиты' : \`▸ показать коммиты (относительно \${configDevBranch}-ветки)\`}</button>
             \${expanded ? renderBranchCommits(b.ref) : ''}
           </div>
@@ -608,7 +750,25 @@ export class ReleasePanel {
         renderBranches();
       });
     });
+
+    // "Выбрать все" отражает состояние ПОКАЗАННЫХ веток (currentBranches — уже отфильтрованный/
+    // урезанный лимитом срез с сервера, см. session.ts sendBranchSlice), а не вообще всех веток
+    // репозитория — отмечен, только если ВСЕ показанные сейчас строки выбраны.
+    document.getElementById('selectAllVisibleBranches').checked =
+      currentBranches.length > 0 && currentBranches.every((b) => selectedRefs.has(b.ref));
   }
+
+  // Статический чекбокс (часть HTML-шаблона, не перерисовывается) — слушатель навешивается один
+  // раз, а не внутри renderBranches(), иначе на каждый рендер списка веток накапливался бы ещё один.
+  document.getElementById('selectAllVisibleBranches').addEventListener('change', (e) => {
+    const checked = e.target.checked;
+    for (const b of currentBranches) {
+      if (checked) selectedRefs.add(b.ref);
+      else selectedRefs.delete(b.ref);
+    }
+    updateSelectedSummary();
+    renderBranches();
+  });
 
   function renderBranchNamesList() {
     document.getElementById('branchNamesList').innerHTML = currentBranches.map((b) => \`<option value="\${b.name}">\`).join('');
@@ -632,7 +792,7 @@ export class ReleasePanel {
   function setBranchListLimitBusy(busy) {
     const btn = document.getElementById('branchListLimitBtn');
     btn.disabled = busy;
-    btn.textContent = busy ? 'Применяем…' : 'Применить';
+    btn.innerHTML = busy ? '<span class="inline-loading">Применяем…</span>' : 'Применить';
   }
   // Чекбокс "скрыть уже в main" и лимит показа применяются ВМЕСТЕ, одним действием — фильтрация
   // по main теперь серверная и должна происходить ДО среза по лимиту (см. session.ts
@@ -648,18 +808,18 @@ export class ReleasePanel {
   // В отличие от "скрыть уже в main" (нужен git-вызов, поэтому по кнопке "Применить"), это просто
   // проверка префикса имени — дёшево, применяется сразу же при переключении чекбокса.
   document.getElementById('hideServiceBranchesFilter').addEventListener('change', (e) => {
-    document.getElementById('branchListInfo').textContent = 'Обновление списка веток…';
+    document.getElementById('branchListInfo').innerHTML = '<span class="inline-loading">Обновление списка веток…</span>';
     vscode.postMessage({ command: 'setHideServiceBranches', hide: e.target.checked });
   });
   function setRefreshBusy(busy) {
     const btn = document.getElementById('refreshBtn');
     btn.disabled = busy;
-    btn.textContent = busy ? 'Обновляем…' : 'Обновить список веток';
+    btn.innerHTML = busy ? '<span class="inline-loading">Обновляем…</span>' : 'Обновить список веток';
   }
   function setPullBusy(busy) {
     const btn = document.getElementById('pullBtn');
     btn.disabled = busy;
-    btn.textContent = busy ? 'Pull…' : 'Pull (checkout + pull)';
+    btn.innerHTML = busy ? '<span class="inline-loading">Pull…</span>' : 'Pull (checkout + pull)';
   }
 
   document.getElementById('refreshBtn').addEventListener('click', () => {
@@ -689,7 +849,7 @@ export class ReleasePanel {
     btn.disabled = busy;
     // Dry-run теперь запускается автоматически сразу после построения хронологии — один и тот же
     // busy-статус кнопки покрывает оба шага, отдельного индикатора для dry-run больше не нужно.
-    btn.textContent = busy ? 'Строим хронологию и проверяем конфликты…' : 'Построить хронологию выбранных веток';
+    btn.innerHTML = busy ? '<span class="inline-loading">Строим хронологию и проверяем конфликты…</span>' : 'Построить хронологию выбранных веток';
   }
 
   document.getElementById('buildPlanBtn').addEventListener('click', () => {
@@ -710,7 +870,7 @@ export class ReleasePanel {
     document.getElementById('itemsArrow').textContent = itemsCollapsed ? '▸' : '▾';
   });
 
-  let contextCollapsed = false;
+  let contextCollapsed = true;
   document.getElementById('toggleContextBtn').addEventListener('click', () => {
     contextCollapsed = !contextCollapsed;
     renderItems();
@@ -725,9 +885,13 @@ export class ReleasePanel {
   // без похода в настройки, но НЕ пересчитывает уже показанный список сразу: значение учитывается
   // только со следующего нажатия "Построить хронологию" (см. onSetStaleBranchesLookback в session.ts).
   function renderStaleBranchesControls() {
+    // Количество веток по шаблону релизной ветки (см. session.ts postReleaseBranchPatternCount) —
+    // раньше отдельной строкой над списком веток, отдельно от самого окна поиска, которое им и
+    // ограничено; показываем прямо тут, как "из скольких всего" — null, пока ответ ещё не пришёл.
+    const totalNote = releaseBranchPatternCount !== null ? \` из \${releaseBranchPatternCount}\` : '';
     return \`<div class="stale-branches-controls muted">Окно поиска — последние
       <input type="number" id="staleBranchesLookbackInput" min="1" step="1" value="\${staleBranchesLookbackReleases}" style="width:3em;" />
-      релиз(ов). Изменение применится при следующем построении хронологии.</div>\`;
+      релиз(ов)\${totalNote}. Изменение применится при следующем построении хронологии.</div>\`;
   }
 
   function bindStaleBranchesLookbackInput() {
@@ -777,17 +941,47 @@ export class ReleasePanel {
   });
 
   document.getElementById('startBtn').addEventListener('click', () => vscode.postMessage({ command: 'startAuto' }));
-  document.getElementById('stepBtn').addEventListener('click', () => vscode.postMessage({ command: 'stepNext' }));
-  document.getElementById('continueBtn').addEventListener('click', () => vscode.postMessage({ command: 'continueConflict' }));
-  document.getElementById('skipBtn').addEventListener('click', () => vscode.postMessage({ command: 'skipConflict' }));
+  document.getElementById('publishBtn').addEventListener('click', () => vscode.postMessage({ command: 'publishRelease' }));
 
+  // Единый источник правды для состояния сборки — считается из currentPlan.items (included/applied),
+  // а не из отдельного клиентского флага, поэтому всегда актуален и после полной пересборки плана
+  // (planBuilt), и после каждого шага применения (см. 'progress' ниже, где applied проставляется
+  // на конкретном item без пересборки всего плана).
   function updateBuildButtonsState() {
     const ready = !!(currentPlan && currentPlan.releaseBranch);
     document.getElementById('startBtn').disabled = !ready;
-    document.getElementById('stepBtn').disabled = !ready;
-    document.getElementById('releaseBranchStatus').textContent = ready
-      ? 'Релизная ветка: ' + currentPlan.releaseBranch
-      : 'Релизная ветка ещё не создана';
+    if (ready) {
+      document.getElementById('releaseBranchStatus').textContent = 'Релизная ветка: ' + currentPlan.releaseBranch;
+    } else {
+      // currentPlan.releaseBranch пуст просто потому, что сборка в ЭТОЙ сессии/плане ещё не
+      // стартовала — это НЕ значит, что подходящей под введённую дату ветки нет в git вообще
+      // (она вполне может уже существовать, например после перезапуска панели или перестроения
+      // хронологии). Жёстко писать сюда "ещё не создана" тут же затирало верный ответ, который
+      // уже пришёл через checkReleaseDate — вместо этого просто перезапрашиваем его заново, он
+      // сам проставит правильный текст (см. releaseDateCheck ниже).
+      requestReleaseDateCheck();
+    }
+
+    const statusEl = document.getElementById('buildStatus');
+    const publishRow = document.getElementById('publishRow');
+    if (!ready) {
+      statusEl.textContent = '';
+      publishRow.style.display = 'none';
+      return;
+    }
+    const included = currentPlan.items.filter((i) => i.included);
+    const appliedCount = included.filter((i) => i.applied).length;
+    const total = included.length;
+    if (total === 0) {
+      statusEl.textContent = 'В хронологии нет отмеченных коммитов.';
+      publishRow.style.display = 'none';
+    } else if (appliedCount === total) {
+      statusEl.innerHTML = \`<span style="color:var(--vscode-charts-green);">✓ Релиз собран — применено \${total} из \${total} коммитов.</span>\`;
+      publishRow.style.display = '';
+    } else {
+      statusEl.textContent = \`Применено \${appliedCount} из \${total} коммитов.\`;
+      publishRow.style.display = 'none';
+    }
   }
 
   // Реальный источник dry-run конфликта на файл — не догадка по пересечению файлов, а фактический
@@ -845,6 +1039,37 @@ export class ReleasePanel {
     return details + hint;
   }
 
+  // Суммаризация под таблицей хронологии — только отмеченные чекбоксом (included) коммиты выбранных
+  // веток; контекстные/якорные коммиты dev в счёт не идут (их и не может быть в currentPlan.items —
+  // они собираются отдельно, см. renderContextRow/renderAnchorRow). Пересчитывается и при полном
+  // рендере (renderItems), и при каждом клике по чекбоксу (см. updateChronologySummary), т.к.
+  // included — клиентское состояние, меняющееся без пересборки хронологии на сервере.
+  function renderChronologySummary(items) {
+    const included = (items || []).filter((i) => i.included);
+    if (included.length === 0) return '';
+    const branches = new Set(included.map((i) => i.branch)).size;
+    const authors = new Set(included.map((i) => i.authorName)).size;
+    const insertions = included.reduce((sum, i) => sum + (i.insertions || 0), 0);
+    const deletions = included.reduce((sum, i) => sum + (i.deletions || 0), 0);
+    const files = new Set();
+    included.forEach((i) => (i.files || []).forEach((f) => files.add(f)));
+    const conflicts = included.filter((i) => i.dryRunStatus === 'conflict').length;
+    const sep = '<span class="chrono-summary-sep">·</span>';
+    const stats = [
+      \`\${included.length} коммит(ов)\`,
+      \`\${branches} веток\`,
+      \`\${authors} авторов\`,
+      \`<span class="diffstat"><span class="diffstat-add">+\${formatDiffCount(insertions)}</span><span class="diffstat-del">-\${formatDiffCount(deletions)}</span></span>\`,
+      \`\${files.size} файлов\`,
+    ];
+    if (conflicts > 0) stats.push(\`<span class="badge conflict">\${conflicts} конфликт(ов)</span>\`);
+    return stats.join(sep);
+  }
+
+  function updateChronologySummary() {
+    document.getElementById('chronoSummaryRow').innerHTML = renderChronologySummary(currentPlan ? currentPlan.items : []);
+  }
+
   function renderItemRow(item) {
     const color = colorFor(item.branch);
     let dryRunBadge = '';
@@ -864,47 +1089,55 @@ export class ReleasePanel {
     }
     const inMainBadge = item.alreadyInMain ? \`<span class="badge inmain">уже в \${configMainBranch}</span>\` : '';
     return \`
-      <div class="item-row">
+      <div class="chrono-cell col-branch">
         <input type="checkbox" class="item-check" data-sha="\${item.sha}" \${item.included ? 'checked' : ''} \${item.applied ? 'disabled' : ''} />
         <span class="lane-label" style="background:\${color}">\${item.branch}</span>
-        <div class="item-main">
-          <div>\${item.subject}</div>
-          <div class="sha">\${item.sha.slice(0,8)} · \${item.authorName} · \${formatDate(item.authorDate)}</div>
-          \${renderLinks(item)}
-          <div>\${appliedBadge}\${dryRunBadge}\${overlapBadge}\${inMainBadge}</div>
-          \${conflictDetails}
-        </div>
+      </div>
+      <div class="chrono-cell col-commit">
+        <div>\${item.subject}</div>
+        <span class="sha">\${item.sha.slice(0,8)}</span>
+        \${renderLinks(item, false)}
+        <div>\${appliedBadge}\${dryRunBadge}\${overlapBadge}\${inMainBadge}</div>
+        \${conflictDetails}
+      </div>
+      <div class="chrono-cell col-date">\${formatDate(item.authorDate)}</div>
+      <div class="chrono-cell col-author" title="\${escapeHtml(item.authorName)}">
+        <div>\${item.authorName}</div>
+        \${renderDiffStatInline(item)}
       </div>
     \`;
   }
 
-  function renderContextRow(commit) {
+  // Общая часть renderContextRow/renderAnchorRow — те же 4 ячейки-колонки, что и у renderItemRow, но
+  // без чекбокса (не относится ни к одной выбранной ветке) и без второй строки +/- в col-author (у
+  // CommitInfo, в отличие от PlanItem, нет insertions/deletions — renderDiffStatInline и так вернёт
+  // '' для них, но раз строки заведомо нет, не рендерим даже пустой контейнер) — subjectHtml
+  // передаётся отдельно, это единственное, что отличает обычный контекстный коммит от "якорного"
+  // (см. renderAnchorRow).
+  function renderContextStyleRow(commit, subjectHtml) {
     return \`
-      <div class="context-row">
+      <div class="chrono-cell col-branch">
         <span class="lane-label">\${configDevBranch}</span>
-        <div class="item-main">
-          <div>\${commit.subject}</div>
-          <div class="sha">\${commit.sha.slice(0,8)} · \${commit.authorName} · \${formatDate(commit.authorDate)}</div>
-          \${renderLinks(commit)}
-        </div>
       </div>
+      <div class="chrono-cell col-commit">
+        <div>\${subjectHtml}</div>
+        <span class="sha">\${commit.sha.slice(0,8)}</span>
+        \${renderLinks(commit)}
+      </div>
+      <div class="chrono-cell col-date">\${formatDate(commit.authorDate)}</div>
+      <div class="chrono-cell col-author" title="\${escapeHtml(commit.authorName)}">\${commit.authorName}</div>
     \`;
+  }
+
+  function renderContextRow(commit) {
+    return renderContextStyleRow(commit, commit.subject);
   }
 
   // Последний коммит dev ПЕРЕД началом хронологии — для ориентира, тот же стиль, что и обычные
   // контекстные коммиты, только с пояснением, почему он вообще тут (иначе непонятно, откуда взялся
   // коммит раньше даты самого первого пункта хронологии).
   function renderAnchorRow(commit) {
-    return \`
-      <div class="context-row">
-        <span class="lane-label">\${configDevBranch}</span>
-        <div class="item-main">
-          <div>\${commit.subject} <span class="muted">— последний коммит \${configDevBranch} перед началом хронологии</span></div>
-          <div class="sha">\${commit.sha.slice(0,8)} · \${commit.authorName} · \${formatDate(commit.authorDate)}</div>
-          \${renderLinks(commit)}
-        </div>
-      </div>
-    \`;
+    return renderContextStyleRow(commit, \`\${commit.subject} <span class="muted">— последний коммит \${configDevBranch} перед началом хронологии</span>\`);
   }
 
   // "Rail" — дорожки веток слева от хронологии (см. drawRail — рисует их одним SVG). Лейн 0 всегда
@@ -1007,6 +1240,14 @@ export class ReleasePanel {
 
   const RAIL_LANE_W = 18;
   const RAIL_DOT_R = 4.5;
+  // Сумма фиксированных колонок .chrono-grid-row (см. CSS) после графа — чекбокс+ветка(152) +
+  // дата(144) + автор(124, там же второй строкой +/-, отдельной колонки "Изменения" больше нет) —
+  // и минимальная ширина гибкой колонки коммита; вместе с --rail-w дают минимальную ширину таблицы
+  // хронологии, ниже которой включается горизонтальный скролл (.chrono-scroll), а не сжатие/наезд
+  // колонок. Держим как константы, а не пересчитываем grid-template-columns по частям, чтобы значения
+  // тут и в CSS не могли разойтись незаметно.
+  const CHRONO_FIXED_COLS_PX = 152 + 144 + 124;
+  const CHRONO_COMMIT_MIN_PX = 160;
 
   // Максимальный НОМЕР лейна, а не rail.laneOf.size (число веток) — с переиспользованием лейнов
   // (см. computeRail) веток может быть больше, чем реально одновременно занятых дорожек, и ширину
@@ -1093,21 +1334,45 @@ export class ReleasePanel {
     // просто начинался вплотную к первой строке, без этого сигнала "тут не всё, есть история раньше".
     lines.push(\`<path d="M \${trunkX},-2 L \${trunkX},\${rowCenters[0]}" stroke="\${trunkColor}" stroke-dasharray="3 3" class="rail-line" />\`);
     lines.push(\`<path d="M \${trunkX},\${rowCenters[0]} L \${trunkX},\${lastY}" stroke="\${trunkColor}" class="rail-line" />\`);
+    // Строка ПЕРЕД первым коммитом ветки (её "якорь" ответвления от dev, см. кривую ниже) — не
+    // всегда контекстный/anchor-коммит dev: если рядом выбрана ЕЩЁ одна ветка, этой строкой в общей
+    // хронологии вполне может оказаться СВОЙ коммит другой ветки (её kind='item', а не context) — а
+    // цикл ниже раньше пропускал ЛЮБУЮ item-строку целиком, ещё до проверки на якорь. Из-за этого
+    // кривая ответвления упиралась в ствол в точке без единой точки-маркера — визуально "куда-то в
+    // пустоту", а не в видимый узел ветвления. Собираем такие якоря заранее, отдельным проходом.
+    const branchOffAnchorRow = new Map(); // idx -> ветка, которая ответвляется от dev сразу ПОСЛЕ этой строки
+    for (const [branch, range] of rail.ranges) {
+      if (range.start !== null && range.start > 0) {
+        branchOffAnchorRow.set(range.start - 1, branch);
+      }
+    }
     merged.forEach((row, idx) => {
-      if (row.kind === 'item') return;
       let color = trunkColor;
-      let mergeBranch = null;
+      let dotBranch = null;
       for (const [branch, range] of rail.ranges) {
         // Финальное (закрывающее лейн) слияние — как и раньше; плюс любое более раннее слияние ЭТОЙ
         // ЖЕ ветки (см. intermediateMergeRows в computeRail — ветка, которую мержили несколько раз за
         // её жизнь) тоже отмечается точкой на стволе, просто не закрывает дорожку.
         if (range.mergedAtRow === idx || range.intermediateMergeRows.includes(idx)) {
           color = colorFor(branch);
-          mergeBranch = branch;
+          dotBranch = branch;
           break;
         }
       }
-      dots.push(railDot(trunkX, rowCenters[idx], color, mergeBranch));
+      if (!dotBranch && branchOffAnchorRow.has(idx)) {
+        // Точка ответвления — это ещё коммит САМОГО dev (ветка от него только оттолкнётся кривой
+        // на следующей строке, см. выше laneCurve(trunkX, ..., x, ...)), поэтому и красится в цвет
+        // ствола, как и сама кривая ответвления (см. её trunkColor чуть ниже) — а не в цвет ветки,
+        // которой на этом коммите ещё физически не существует.
+        dotBranch = branchOffAnchorRow.get(idx);
+        color = trunkColor;
+      }
+      // Обычный контекстный/anchor-коммит dev — точка всегда нужна (он и есть настоящий коммит
+      // ствола). Чужой item другой ветки — точка на СТВОЛЕ нужна только если это чей-то якорь
+      // ответвления; иначе здесь просто нет ничего своего у dev, дублировать точку не нужно (у
+      // самого коммита уже есть точка на его собственной дорожке, см. цикл по веткам ниже).
+      if (row.kind === 'item' && !dotBranch) return;
+      dots.push(railDot(trunkX, rowCenters[idx], color, dotBranch));
     });
 
     for (const [branch, lane] of [...rail.laneOf.entries()].sort((a, b) => a[1] - b[1])) {
@@ -1123,30 +1388,44 @@ export class ReleasePanel {
       // ответвление; например контекстные коммиты dev свёрнуты и точка ветвления вместе с ними),
       // симметрично нижнему "хвосту" у невлитых веток дорожка обрывается пунктиром за ВЕРХНИЙ край —
       // сигнал "ветвление было раньше показанного окна", а не оборванная на середине линия.
+      //
+      // Цвет этой кривой — trunkColor (цвет dev), а не свой цвет ветки: так же, как в Bitbucket,
+      // "начало ответвления" красится в цвет ветки, ОТ КОТОРОЙ создаётся новая — обычно это dev.
+      // Свой цвет ветки появляется дальше, начиная с её собственной дорожки/точек.
       if (range.start > 0) {
-        lines.push(\`<path d="\${laneCurve(trunkX, rowCenters[range.start - 1], x, rowCenters[range.start])}" stroke="\${color}" class="rail-line" data-branch="\${branch}" />\`);
+        lines.push(\`<path d="\${laneCurve(trunkX, rowCenters[range.start - 1], x, rowCenters[range.start])}" stroke="\${trunkColor}" class="rail-line" data-branch="\${branch}" />\`);
       } else {
         // Небольшой выступ (плюс отступ #items сверху — см. CSS) — раньше заезжал на строку с
         // кнопкой "показать/скрыть контекстные коммиты dev", расположенную прямо над списком.
         lines.push(\`<path d="M \${x},-2 L \${x},\${rowCenters[range.start]}" stroke="\${color}" stroke-dasharray="3 3" class="rail-line" data-branch="\${branch}" />\`);
       }
-      // Между стартом и финальным слиянием дорожка идёт прямой линией на СВОЕЙ дорожке, но на каждом
-      // промежуточном слиянии (см. intermediateMergeRows в computeRail — ветку мержили больше одного
-      // раза за её жизнь) ненадолго "заходит" на ствол и возвращается обратно — та же кривая, что и у
-      // финального слияния, просто без закрытия лейна: дальше дорожка продолжается как ни в чём не бывало.
-      let cursor = range.start;
-      for (const mergeIdx of range.intermediateMergeRows) {
-        const outFrom = Math.max(cursor, mergeIdx - 1);
-        if (outFrom > cursor) {
-          lines.push(\`<path d="M \${x},\${rowCenters[cursor]} L \${x},\${rowCenters[outFrom]}" stroke="\${color}" class="rail-line" data-branch="\${branch}" />\`);
-        }
-        lines.push(\`<path d="\${laneCurve(x, rowCenters[outFrom], trunkX, rowCenters[mergeIdx])}" stroke="\${color}" class="rail-line" data-branch="\${branch}" />\`);
-        const backTo = Math.min(mergeIdx + 1, vertEndIdx);
-        lines.push(\`<path d="\${laneCurve(trunkX, rowCenters[mergeIdx], x, rowCenters[backTo])}" stroke="\${color}" class="rail-line" data-branch="\${branch}" />\`);
-        cursor = backTo;
+      // Основная дорожка ветки — ОДНА непрерывная линия на своём лейне от первого коммита до
+      // последнего (или до финального слияния), не прерывающаяся промежуточными слияниями. Раньше
+      // линия буквально "заходила" на ствол в промежуточном слиянии и возвращалась на свой лейн
+      // СЛЕДУЮЩЕЙ строкой (mergeIdx + 1) — но следующая строка — это просто следующая по дате
+      // запись в общем списке, а НЕ обязательно следующий свой коммит ветки: если между двумя
+      // слияниями одной и той же ветки в хронологии оказывался посторонний коммит dev (обычное
+      // дело — работа над задачей растянулась на несколько раундов, и между ними dev жил дальше),
+      // дорожка визуально "стояла" на стволе все эти строки и снова "отделялась" от dev прямо на
+      // этом чужом коммите — то есть повторное ветвление выглядело так, будто идёт от dev, а не от
+      // собственного первого коммита ветки (реальный баг, найденный на примере feature/DOS-2841 с
+      // двумя вливаниями). Промежуточное слияние теперь рисуется отдельным "усом" (лёгкий изгиб к
+      // стволу) ПОВЕРХ этой непрерывной линии, а не как часть её пути.
+      if (vertEndIdx > range.start) {
+        lines.push(\`<path d="M \${x},\${rowCenters[range.start]} L \${x},\${rowCenters[vertEndIdx]}" stroke="\${color}" class="rail-line" data-branch="\${branch}" />\`);
       }
-      if (vertEndIdx > cursor) {
-        lines.push(\`<path d="M \${x},\${rowCenters[cursor]} L \${x},\${rowCenters[vertEndIdx]}" stroke="\${color}" class="rail-line" data-branch="\${branch}" />\`);
+      for (const mergeIdx of range.intermediateMergeRows) {
+        // Только "ус" ВХОДА в промежуточное слияние (свой коммит перед ним → ствол на строке
+        // слияния) — ветка реально влилась в dev именно этим PR. "Уса" ВОЗВРАТА со ствола обратно
+        // на лейн больше нет: следующий свой коммит ветки и так уже соединён напрямую сплошной
+        // линией выше (см. комментарий про непрерывную дорожку) — рисовать вдобавок кривую
+        // ствол→лейн в ту же самую точку означало ответвление НАЧИНАЕТСЯ ОТ СТВОЛА визуально
+        // неотличимо от настоящего нового ветвления, хотя на деле это тот же самый коммит,
+        // просто ещё раз влитый позже (найдено на реальных двух PR feature/DOS-2841: #1661 и #1662).
+        const outFrom = Math.max(range.start, mergeIdx - 1);
+        if (outFrom !== mergeIdx) {
+          lines.push(\`<path d="\${laneCurve(x, rowCenters[outFrom], trunkX, rowCenters[mergeIdx])}" stroke="\${color}" class="rail-line" data-branch="\${branch}" />\`);
+        }
       }
       if (isMerged) {
         lines.push(\`<path d="\${laneCurve(x, rowCenters[vertEndIdx], trunkX, rowCenters[range.mergedAtRow])}" stroke="\${color}" class="rail-line" data-branch="\${branch}" />\`);
@@ -1188,9 +1467,12 @@ export class ReleasePanel {
     if (!currentPlan || currentPlan.items.length === 0) {
       el.innerHTML = '<div class="muted">Постройте хронологию, чтобы увидеть коммиты</div>';
       toggleBtn.style.display = 'none';
+      document.getElementById('chronoHeaderRow').style.display = 'none';
+      updateChronologySummary();
       renderCherryPickCommands();
       return;
     }
+    document.getElementById('chronoHeaderRow').style.display = '';
 
     shaToBranch = new Map(currentPlan.items.map((i) => [i.sha, i.branch]));
 
@@ -1244,18 +1526,27 @@ export class ReleasePanel {
     const rail = computeRail(merged);
     const railW = railWidth(rail);
 
+    // --rail-w приводит первую колонку .chrono-grid-row (заголовок, строки, футер — везде одно и то
+    // же правило) к той же ширине, что и сам SVG-граф ниже; minWidth — порог, ниже которого фиксированные
+    // колонки не могут сжаться дальше, поэтому .chrono-scroll включает горизонтальный скролл вместо
+    // наезда колонок друг на друга (см. CHRONO_FIXED_COLS_PX/CHRONO_COMMIT_MIN_PX выше).
+    const chronoInner = document.getElementById('chronoInner');
+    chronoInner.style.setProperty('--rail-w', railW + 'px');
+    chronoInner.style.minWidth = (railW + CHRONO_FIXED_COLS_PX + CHRONO_COMMIT_MIN_PX) + 'px';
+
     el.innerHTML =
       '<div class="rail-overlay" id="railOverlay"></div>' +
       merged
         .map((entry) => {
-          if (entry.kind === 'item') return \`<div class="timeline-row"><div class="rail-spacer" style="width:\${railW}px"></div>\${renderItemRow(entry.item)}</div>\`;
-          if (entry.kind === 'anchor') return \`<div class="timeline-row"><div class="rail-spacer" style="width:\${railW}px"></div>\${renderAnchorRow(entry.commit)}</div>\`;
+          if (entry.kind === 'item') return \`<div class="timeline-row chrono-grid-row"><div class="rail-spacer"></div>\${renderItemRow(entry.item)}</div>\`;
+          if (entry.kind === 'anchor') return \`<div class="timeline-row chrono-grid-row chrono-context"><div class="rail-spacer"></div>\${renderAnchorRow(entry.commit)}</div>\`;
           if (entry.kind === 'mergeMarker' && contextCollapsed) {
             // Невидимая строка-маркер: нулевая высота, без текста, без разделителя — только чтобы у
             // дорожки была Y-координата для кривой слияния, пока контекстные коммиты свёрнуты.
-            return \`<div class="timeline-row timeline-row-hidden"><div class="rail-spacer" style="width:\${railW}px"></div></div>\`;
+            // Без chrono-grid-row — она невидима, grid-раскладка ей ни для чего не нужна.
+            return \`<div class="timeline-row timeline-row-hidden"><div class="rail-spacer"></div></div>\`;
           }
-          return \`<div class="timeline-row"><div class="rail-spacer" style="width:\${railW}px"></div>\${renderContextRow(entry.commit)}</div>\`;
+          return \`<div class="timeline-row chrono-grid-row chrono-context"><div class="rail-spacer"></div>\${renderContextRow(entry.commit)}</div>\`;
         })
         .join('');
 
@@ -1317,10 +1608,12 @@ export class ReleasePanel {
         if (item) item.included = included;
         vscode.postMessage({ command: 'toggleItem', sha, included });
         renderCherryPickCommands();
+        updateChronologySummary();
       });
     });
 
     renderCherryPickCommands();
+    updateChronologySummary();
   }
 
   function buildCherryPickSegments(items) {
@@ -1419,12 +1712,36 @@ export class ReleasePanel {
       selectionInitialized = false;
       limitInitialized = false;
       currentPlan = null;
+      shaToBranch = new Map();
+      document.getElementById('releaseBranchInfo').innerHTML = '';
+      releaseBranchPatternCount = null;
+      document.getElementById('createBranchBtn').disabled = false;
       showError('');
       document.getElementById('branchList').innerHTML = '<div class="muted branch-list-loading">Загрузка веток…</div>';
       document.getElementById('branchListInfo').textContent = 'Загрузка списка веток…';
       lastStaleHints = null;
       document.getElementById('staleBranches').innerHTML = '';
       copiedCherryCmdKeys.clear();
+      // Ещё не отправленный запрос фильтрации с ПРЕЖНИМ текстом (debounce) — иначе он всё равно
+      // долетит до сервера через 150мс и применится уже к новому проекту.
+      clearTimeout(filterDebounce);
+      document.getElementById('branchFilter').value = '';
+      // Чекбоксы "скрыть в main"/"скрыть служебные" — состояние конкретной ReleaseSession
+      // (hideAlreadyInMain/hideServiceBranches), у новой она всегда стартует со значений по
+      // умолчанию (false); без сброса чекбоксы визуально остаются отмеченными от прежнего проекта,
+      // хотя реально уже ничего не скрывают.
+      document.getElementById('hideInMainFilter').checked = false;
+      document.getElementById('hideServiceBranchesFilter').checked = false;
+      // Кэши/назначения цветов ключуются по имени ветки/ref — у другого проекта (другой репозиторий)
+      // те же имена/refs вполне могут существовать (например, одноимённая задача), и без сброса под
+      // ними оказались бы данные ЧУЖОГО репозитория (коммиты, статус "в main", даже цвет дорожки).
+      expandedRefs = new Set();
+      branchCommitsCache.clear();
+      branchNameByRef.clear();
+      branchMainStatusOverride.clear();
+      branchDiffStatByRef.clear();
+      colorAssignments.clear();
+      nextColorIndex = 0;
       renderItems();
       updateBuildButtonsState();
     } else if (msg.command === 'currentBranch') {
@@ -1441,6 +1758,11 @@ export class ReleasePanel {
     } else if (msg.command === 'branches') {
       setBranchListLimitBusy(false);
       setRefreshBusy(false);
+      // Первый ответ 'branches' — надёжный признак, что this.fullBranches на сервере уже
+      // загружен: перепроверяем дату релиза именно теперь, а не только сразу при загрузке
+      // скрипта (тот самый первый запрос мог улететь раньше, чем сервер успел построить список
+      // веток, и вернуться с заведомо пустым/неполным результатом).
+      requestReleaseDateCheck();
       currentBranches = msg.branches;
       for (const b of msg.branches) branchNameByRef.set(b.ref, b.name);
       // Выбор веток — состояние клиента; из сервера принимаем его только один раз при первом
@@ -1473,6 +1795,14 @@ export class ReleasePanel {
         branchMainStatusOverride.set(ref, status);
       }
       renderBranches();
+    } else if (msg.command === 'branchDiffStats') {
+      // Агрегированная сводка +/- и число файлов, тем же фоновым проходом, что и branchMainStatus
+      // выше (см. session.ts runBranchMainStatusRefinePass) — приходит отдельным сообщением, чтобы
+      // не завязывать формат branchMainStatus на неё.
+      for (const [ref, stat] of Object.entries(msg.diffStatByRef)) {
+        branchDiffStatByRef.set(ref, stat);
+      }
+      renderBranches();
     } else if (msg.command === 'branchCommits') {
       branchCommitsCache.set(msg.ref, { commits: msg.commits, truncated: msg.truncated, forkedFrom: msg.forkedFrom });
       // Точный статус по факту разворачивания: видно КАЖДЫЙ коммит ветки, поэтому можно отличить
@@ -1487,9 +1817,44 @@ export class ReleasePanel {
       currentPlan = msg.plan;
       lastStaleHints = null;
       document.getElementById('staleBranches').innerHTML = '';
+      // Подсказка "что уже реально в ветке" (см. releaseBranchInfo ниже) была на случай ОТСУТСТВИЯ
+      // полного плана — раз он появился (даже пустой, только с releaseBranch), она уже не нужна.
+      document.getElementById('releaseBranchInfo').innerHTML = '';
       copiedCherryCmdKeys.clear();
       renderItems();
       updateBuildButtonsState();
+    } else if (msg.command === 'releaseBranchPatternCount') {
+      releaseBranchPatternCount = msg.count;
+      // Число входит прямо в текст окна поиска забытых веток (см. renderStaleBranchesControls) —
+      // перерисовываем тот же блок, что уже показан (результаты, если поиск успел завершиться,
+      // иначе всё ещё "загрузка"), чтобы новое число не осталось висеть только при следующей
+      // перерисовке от другого события.
+      if (lastStaleHints !== null) renderStaleBranches(lastStaleHints);
+      else renderStaleBranchesLoading();
+    } else if (msg.command === 'releaseDateCheck') {
+      // Не трогаем текст статуса, если уже есть готовый план (см. updateBuildButtonsState — там
+      // же он сам покажет "Релизная ветка: X"/прогресс сборки) — иначе просмотр другой даты в поле
+      // затирал бы актуальный статус уже идущей сборки текстом про эту, ещё не выбранную дату.
+      const btn = document.getElementById('createBranchBtn');
+      btn.disabled = msg.exists;
+      const ready = !!(currentPlan && currentPlan.releaseBranch);
+      if (!ready) {
+        document.getElementById('releaseBranchStatus').textContent = msg.exists
+          ? \`Ветка "\${msg.branchName}" уже существует — используйте «Начать сборку»\`
+          : 'Релизная ветка ещё не создана';
+      }
+    } else if (msg.command === 'releaseBranchInfo') {
+      const el = document.getElementById('releaseBranchInfo');
+      if (!msg.commits || msg.commits.length === 0) {
+        el.innerHTML = '';
+      } else {
+        const rows = msg.commits.map((c) => {
+          const link = c.commitUrl ? \`<a href="\${c.commitUrl}" target="_blank" rel="noopener">\${c.sha.slice(0,8)}</a>\` : c.sha.slice(0,8);
+          const taskLink = c.taskUrl ? \` · <a href="\${c.taskUrl}" target="_blank" rel="noopener">задача</a>\` : '';
+          return \`<div>→ «\${escapeHtml(c.subject)}», \${link} · \${escapeHtml(c.authorName)} · \${formatDate(c.authorDate)}\${taskLink}</div>\`;
+        }).join('');
+        el.innerHTML = \`<div>Уже в ветке \${escapeHtml(msg.releaseBranch)} (плана нет — выберите те же ветки и постройте хронологию, чтобы увидеть полную картину):</div>\${rows}\`;
+      }
     } else if (msg.command === 'staleBranchesLoading') {
       renderStaleBranchesLoading();
     } else if (msg.command === 'staleBranches') {
@@ -1502,14 +1867,20 @@ export class ReleasePanel {
         const found = currentPlan.items.find((i) => i.sha === ev.item.sha);
         if (found) found.applied = true;
         renderItems();
+        updateBuildButtonsState();
       } else if (ev.type === 'conflict') {
         showError(
-          'Конфликт на пункте ' + ev.item.sha.slice(0,8) + ' ("' + ev.item.subject + '"). ' +
-          'Разрешите конфликт в файлах репозитория, затем нажмите "Продолжить после конфликта".'
+          'Конфликт на коммите ' + ev.item.sha.slice(0,8) + ' ("' + ev.item.subject + '"). ' +
+          'Разрешите конфликт в файлах репозитория и нажмите "Начать сборку" ещё раз — сборка продолжится с этого же места.'
         );
+        updateBuildButtonsState();
       } else if (ev.type === 'done') {
         showError('');
+        updateBuildButtonsState();
       }
+    } else if (msg.command === 'published') {
+      document.getElementById('buildStatus').innerHTML =
+        '<span style="color:var(--vscode-charts-green);">✓ Релизная ветка опубликована (запушена в remote).</span>';
     } else if (msg.command === 'error') {
       setBuildPlanBusy(false);
       setBranchListLimitBusy(false);

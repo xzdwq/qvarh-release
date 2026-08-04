@@ -11,14 +11,27 @@ export interface DryRunOutcome {
 }
 
 /**
- * Реально прогоняет cherry-pick выбранных коммитов во временном git worktree (не трогая
- * рабочий каталог пользователя), чтобы точно узнать, где будут конфликты, а не гадать по файлам.
+ * Реально прогоняет cherry-pick выбранных, ещё НЕ применённых коммитов во временном git worktree
+ * (не трогая рабочий каталог пользователя), чтобы точно узнать, где будут конфликты, а не гадать
+ * по файлам.
+ *
+ * Уже применённые (item.applied — реально закоммиченные в релизную ветку, см.
+ * session.ts syncAppliedFromReleaseBranch) пункты сюда не попадают вовсе: они уже случились,
+ * пересимулировать их незачем, а главное — baseRef может быть основной веткой, в которой этого
+ * содержимого ЕЩЁ нет, и тогда попытка cherry-pick'а уже применённого коммита с нуля легко даёт
+ * ЛОЖНЫЙ конфликт (например, если между ним и следующим пунктом есть смысловая зависимость,
+ * которая в реальности уже удовлетворена, а в чистой симуляции от baseRef — ещё нет).
+ *
+ * baseRef — не обязательно основная ветка: если релизная ветка уже существует и в ней реально
+ * что-то применено, вызывающий код (см. runDryRunOnCurrentPlan в session.ts) передаёт СЮДА именно
+ * её — тогда симуляция оставшихся пунктов идёт от того состояния, что будет в реальности при
+ * следующем "Начать сборку", а не от main, где часть контекста может отсутствовать.
  */
-export async function performDryRun(git: GitService, mainRef: string, items: PlanItem[]): Promise<DryRunOutcome> {
-  const included = items.filter((i) => i.included);
+export async function performDryRun(git: GitService, baseRef: string, items: PlanItem[]): Promise<DryRunOutcome> {
+  const included = items.filter((i) => i.included && !i.applied);
   const tmpDir = path.join(os.tmpdir(), `qvarh-release-dryrun-${crypto.randomUUID()}`);
 
-  await git.addWorktree(tmpDir, mainRef);
+  await git.addWorktree(tmpDir, baseRef);
   const worktreeGit = new GitService(tmpDir);
 
   const results: DryRunResult[] = [];

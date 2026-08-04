@@ -1,5 +1,5 @@
 import { FirstParentCommit, GitService, mainSubjectDateKey } from '../git/gitService';
-import { BranchRef, CommitInfo, ConflictCause, MainStatus, PlanItem, StaleBranchHint } from './types';
+import { BranchCommitInfo, BranchDiffStat, BranchRef, CommitInfo, ConflictCause, MainStatus, PlanItem, StaleBranchHint } from './types';
 
 /** Сколько коммитов максимум забирать по одной ветке — защита от аномально большого диапазона (например, сильно отставшая dev-ветка). */
 export const MAX_COMMITS_PER_BRANCH = 300;
@@ -257,7 +257,46 @@ async function markAlreadyInMain(git: GitService, commits: FirstParentCommit[], 
   }));
 }
 
-/** Коммиты ветки, уникальные относительно devRef — без диффа файлов, для лёгкого предпросмотра (expand в списке веток). */
+/**
+ * Содержимое (не SHA — коммит после cherry-pick имеет другой SHA и родителей) каких из переданных
+ * коммитов уже реально есть в указанном ref — тот же patch-id/subject+date приём, что и
+ * markAlreadyInMain/isAlreadyInMain выше, но параметризован произвольным ref, а не жёстко main:
+ * используется, чтобы после перезапуска VS Code понять, какие пункты плана уже применены в
+ * РЕЛИЗНУЮ ветку (см. syncAppliedFromReleaseBranch в session.ts), а не главную — persist()
+ * сохраняет item.applied после каждого шага, но если сессия закрылась ДО того, как это записалось
+ * (или git-историю поменяли не через это расширение), голое доверие сохранённому флагу неверно.
+ */
+export async function findCommitsAlreadyInRef(
+  git: GitService,
+  ref: string,
+  commits: { sha: string; subject: string; authorDate: string }[]
+): Promise<Set<string>> {
+  if (commits.length === 0) {
+    return new Set();
+  }
+  const minDate = commits.reduce((min, c) => (c.authorDate < min ? c.authorDate : min), commits[0].authorDate);
+  const [matchIndex, ownPatchIds] = await Promise.all([
+    buildMainMatchIndex(git, ref, minDate),
+    git.computePatchIdsForCommits(commits.map((c) => c.sha)),
+  ]);
+  const result = new Set<string>();
+  for (const c of commits) {
+    if (isAlreadyInMain(matchIndex, c, ownPatchIds)) {
+      result.add(c.sha);
+    }
+  }
+  return result;
+}
+
+/**
+ * Коммиты ветки, уникальные относительно devRef, для предпросмотра (expand в списке веток) — с
+ * числом добавленных/удалённых строк на каждый (см. GitService.diffStat), как и в основной
+ * хронологии (см. collectBranchItems), но отдельным типом BranchCommitInfo, а не полем в CommitInfo:
+ * этот вызов идёт ТОЛЬКО когда пользователь сам разворачивает конкретную ветку в списке, а не на
+ * каждое построение плана — раздувать CommitInfo (используется и для контекстных/якорных коммитов
+ * хронологии, которых на порядок больше и diffstat для них никто не просил) лишним git-вызовом на
+ * коммит не нужно.
+ */
 export async function getBranchCommits(
   git: GitService,
   branch: BranchRef,
@@ -265,7 +304,7 @@ export async function getBranchCommits(
   mainRef: string,
   devFirstParentShas?: DevFirstParentShas,
   extraBaseRefs: ExtraBaseRef[] = []
-): Promise<{ commits: CommitInfo[]; truncated: boolean; forkedFrom?: string }> {
+): Promise<{ commits: BranchCommitInfo[]; truncated: boolean; forkedFrom?: string }> {
   const ownShas = devFirstParentShas ?? (await git.buildDevFirstParentSet(devRef));
   const { commits, truncated, forkedFrom } = await resolveBranchOwnCommits(
     git,
@@ -276,7 +315,16 @@ export async function getBranchCommits(
     MAX_COMMITS_PER_BRANCH,
     extraBaseRefs
   );
-  return { commits: await markAlreadyInMain(git, commits, mainRef), truncated, forkedFrom };
+  const withMainStatus = await markAlreadyInMain(git, commits, mainRef);
+  const diffStats = await mapWithConcurrency(withMainStatus, CONCURRENCY, (commit) =>
+    git.diffStat(commit.sha, commit.parents[0] ?? EMPTY_TREE_SHA)
+  );
+  const withDiffStat = withMainStatus.map((commit, i) => ({
+    ...commit,
+    insertions: diffStats[i].insertions,
+    deletions: diffStats[i].deletions,
+  }));
+  return { commits: withDiffStat, truncated, forkedFrom };
 }
 
 async function collectBranchItems(
@@ -339,6 +387,12 @@ async function collectBranchItems(
  * — тот же алгоритм, что и для хронологии), поэтому статус получается точным. Дороже: до двух
  * git-вызовов на ветку вместо одного пакетного на весь список сразу — поэтому вызывается ПОСЛЕ
  * быстрого прохода, в фоне, не блокируя первичный рендер списка веток (см. session.ts).
+ *
+ * Попутно (тем же проходом, БЕЗ повторного resolveBranchOwnCommits — он и так самая дорогая часть
+ * здесь) считается агрегированный diffstat ветки (см. BranchDiffStat в types.ts) для превью в
+ * строке списка, без разворачивания коммитов вручную: один git diff --numstat между первым
+ * родителем САМОГО РАННЕГО собственного коммита и кончиком ветки — то есть ещё один git-вызов на
+ * ветку, а не по вызову на коммит, как у per-commit diffStat при разворачивании (см. getBranchCommits).
  */
 export async function computeMainStatusForBranches(
   git: GitService,
@@ -347,7 +401,7 @@ export async function computeMainStatusForBranches(
   mainRef: string,
   devFirstParentShas: DevFirstParentShas,
   extraBaseRefs: ExtraBaseRef[] = []
-): Promise<Map<string, MainStatus>> {
+): Promise<{ statusByRef: Map<string, MainStatus>; diffStatByRef: Map<string, BranchDiffStat> }> {
   const perBranch = await mapWithConcurrency(branches, BACKGROUND_CONCURRENCY, async (branch) => {
     try {
       const { commits } = await resolveBranchOwnCommits(
@@ -359,16 +413,31 @@ export async function computeMainStatusForBranches(
         MAX_COMMITS_PER_BRANCH,
         extraBaseRefs
       );
-      return { ref: branch.ref, commits };
+      let diffStat: BranchDiffStat | null = null;
+      if (commits.length > 0) {
+        try {
+          const base = commits[0].parents[0] ?? EMPTY_TREE_SHA;
+          const tip = commits[commits.length - 1].sha;
+          const stat = await git.diffStat(tip, base);
+          diffStat = { insertions: stat.insertions, deletions: stat.deletions, filesChanged: stat.files.length };
+        } catch {
+          // Второстепенная сводка — молча остаёмся без неё для этой ветки, основной статус "в main" не трогаем.
+        }
+      }
+      return { ref: branch.ref, commits, diffStat };
     } catch {
-      return { ref: branch.ref, commits: [] as FirstParentCommit[] };
+      return { ref: branch.ref, commits: [] as FirstParentCommit[], diffStat: null as BranchDiffStat | null };
     }
   });
 
   const allCommits = perBranch.flatMap((b) => b.commits);
-  const result = new Map<string, MainStatus>();
+  const statusByRef = new Map<string, MainStatus>();
+  const diffStatByRef = new Map<string, BranchDiffStat>();
+  for (const { ref, diffStat } of perBranch) {
+    if (diffStat) diffStatByRef.set(ref, diffStat);
+  }
   if (allCommits.length === 0) {
-    return result;
+    return { statusByRef, diffStatByRef };
   }
 
   const minDate = allCommits.reduce((min, c) => (c.authorDate < min ? c.authorDate : min), allCommits[0].authorDate);
@@ -384,9 +453,9 @@ export async function computeMainStatusForBranches(
       continue;
     }
     const matched = commits.filter((c) => isAlreadyInMain(matchIndex, c, ownPatchIds)).length;
-    result.set(ref, matched === 0 ? 'none' : matched === commits.length ? 'full' : 'partial');
+    statusByRef.set(ref, matched === 0 ? 'none' : matched === commits.length ? 'full' : 'partial');
   }
-  return result;
+  return { statusByRef, diffStatByRef };
 }
 
 /** Помечает коммиты, которые правят те же файлы, что и коммиты с ДРУГИХ выбранных веток. */

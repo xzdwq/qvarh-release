@@ -716,9 +716,26 @@ export class GitService {
     }
   }
 
+  /**
+   * sha коммита, чей cherry-pick начат, но не завершён (--continue/--skip/--abort ещё не вызван) —
+   * null, если сейчас такого нет. Надёжнее проверки "есть ли конфликтующие файлы": пользователь
+   * может разрешить конфликт и застейджить файлы (git add), но последовательность cherry-pick при
+   * этом всё ещё числится незавершённой, пока не выполнен --continue — на этом этапе конфликтующих
+   * файлов уже 0, но CHERRY_PICK_HEAD ещё существует. Используется, чтобы применение следующего
+   * пункта плана (см. applyNextItem в executor.ts) понимало "нужно продолжить именно ЭТУ, уже
+   * начатую попытку (--continue)" вместо того, чтобы начинать новый cherry-pick с нуля.
+   */
+  async cherryPickHeadSha(): Promise<string | null> {
+    try {
+      const out = await this.git.raw(['rev-parse', '--verify', 'CHERRY_PICK_HEAD']);
+      return out.trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
   async isCherryPickInProgress(): Promise<boolean> {
-    const status = await this.git.status();
-    return status.conflicted.length > 0;
+    return (await this.cherryPickHeadSha()) !== null;
   }
 
   async conflictedFiles(): Promise<string[]> {
@@ -745,8 +762,29 @@ export class GitService {
     return { sha, parents: parents.split(' ').filter(Boolean), subject, authorDate, authorName };
   }
 
-  async cherryPickContinue(): Promise<void> {
-    await this.git.raw(['cherry-pick', '--continue']);
+  /**
+   * Продолжает уже начатый (см. cherryPickHeadSha) cherry-pick того же коммита — пользователь тем
+   * временем разрешил конфликт руками в рабочем каталоге. Та же обработка исходов, что и у
+   * cherryPickIntegrationCommit: если после --continue конфликт всё ещё остаётся (разрешили не все
+   * файлы) — не сырая git-ошибка, а тот же GitConflictError, с которым UI уже умеет работать
+   * (см. applyNextItem в executor.ts).
+   */
+  async continueCherryPick(commit: FirstParentCommit): Promise<'applied' | 'empty'> {
+    try {
+      await this.git.raw(['cherry-pick', '--continue']);
+      return 'applied';
+    } catch (err) {
+      const conflicted = await this.conflictedFiles();
+      if (conflicted.length === 0) {
+        await this.cherryPickSkip();
+        return 'empty';
+      }
+      throw new GitConflictError(
+        `Конфликт коммита ${commit.sha.slice(0, 8)} ("${commit.subject}") разрешён не полностью. ` +
+          'Разрешите оставшиеся конфликты в рабочем каталоге и нажмите "Начать сборку" ещё раз.',
+        commit.sha
+      );
+    }
   }
 
   async cherryPickAbort(): Promise<void> {
@@ -755,5 +793,40 @@ export class GitService {
 
   async cherryPickSkip(): Promise<void> {
     await this.git.raw(['cherry-pick', '--skip']);
+  }
+
+  /** Публикует релизную ветку в remote (с установкой upstream, -u) — обычный git push. */
+  async pushBranch(remoteName: string, branchName: string): Promise<void> {
+    await this.git.push(['-u', remoteName, branchName]);
+  }
+
+  /**
+   * Собственные коммиты релизной ветки — всё, что в ней есть, а в mainRef нет. Используется, когда
+   * для найденной релизной ветки нет сохранённого плана (см. loadReleaseBranchOwnCommits в
+   * session.ts) — например, ветку создали в старой версии расширения без сохранения состояния,
+   * или вручную — чтобы всё равно показать, какие задачи в ней уже реально есть. Простой `--not
+   * mainRef`, а не resolveBranchOwnCommits из planner.ts (там форк-поинт/повторное использование
+   * имён учитываются намеренно сложнее — актуально для feature-веток относительно dev; релизная
+   * ветка создаётся линейно от main, этой сложности здесь нет).
+   */
+  async releaseBranchOwnCommits(releaseBranch: string, mainRef: string, maxCount: number): Promise<FirstParentCommit[]> {
+    const format = ['%H', '%P', '%s', '%aI', '%an'].join('%x1f');
+    const raw = await this.git.raw([
+      'log',
+      releaseBranch,
+      '--not',
+      mainRef,
+      '--no-merges',
+      `--max-count=${maxCount}`,
+      `--pretty=format:${format}%x1e`,
+    ]);
+    return raw
+      .split('\x1e')
+      .map((e) => e.trim())
+      .filter(Boolean)
+      .map((entry) => {
+        const [sha, parents, subject, authorDate, authorName] = entry.split('\x1f');
+        return { sha, parents: parents.split(' ').filter(Boolean), subject, authorDate, authorName };
+      });
   }
 }

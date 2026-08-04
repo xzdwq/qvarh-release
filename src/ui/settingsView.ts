@@ -130,7 +130,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   hr { border: none; border-top: 1px solid var(--vscode-panel-border); margin: 16px 0; }
 
   .panel-header { margin-bottom: 10px; }
-  .panel-header .hint { margin-top: 2px; }
 
   .projects-list { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
   .project-row {
@@ -157,7 +156,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   <div class="panel-header">
     <h3>Проекты</h3>
-    <div class="hint">Профиль репозитория — путь на диске и настройки веток/ссылок. Кнопка 🚀 у проекта сразу открывает панель сборки для него, независимо от того, какой workspace открыт сейчас.</div>
   </div>
 
   <div id="projectsList" class="projects-list"></div>
