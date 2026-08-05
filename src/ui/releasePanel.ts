@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { BranchCommitInfo, BranchDiffStat, BranchRef, MainStatus, ReleasePlan, StaleBranchHint } from '../core/types';
 import { ExecutorEvent } from '../core/executor';
+import { setActiveProjectId } from '../activeProject';
 
 export interface BranchListInfo {
   totalMatches: number;
@@ -15,7 +16,8 @@ export interface ReleasePanelHost {
   onFilterBranches(query: string): Promise<void>;
   onSetBranchListLimit(limit: number, hideAlreadyInMain: boolean): Promise<void>;
   onSetHideServiceBranches(hide: boolean): Promise<void>;
-  onPullBranch(branchName: string): Promise<void>;
+  onSwitchBranch(branchName: string): Promise<void>;
+  onPullCurrentBranch(): Promise<void>;
   onExpandBranch(ref: string): Promise<void>;
   onBuildPlan(selectedRefs: string[]): Promise<void>;
   onClearPlan(): Promise<void>;
@@ -61,6 +63,7 @@ export class ReleasePanel {
       ReleasePanel.current.panel.title = title;
       ReleasePanel.current.host = host;
       ReleasePanel.current.currentProjectId = context?.projectId;
+      setActiveProjectId(context?.projectId);
       if (switched) {
         ReleasePanel.current.panel.webview.postMessage({ command: 'resetForNewContext' });
       }
@@ -71,8 +74,13 @@ export class ReleasePanel {
       retainContextWhenHidden: true,
       localResourceRoots: [extensionUri],
     });
-    ReleasePanel.current = new ReleasePanel(panel, host, extensionUri);
+    // .png, а не .svg с currentColor — иконка вкладки рендерится VS Code вне DOM самой веб-страницы
+    // (нет унаследованного --vscode-foreground, как в заголовке панели, см. .app-logo), currentColor
+    // резолвился бы в чёрный. .png уже с фиксированным цветом (тот же глиф, см. media/icon.png).
+    panel.iconPath = vscode.Uri.joinPath(extensionUri, 'media', 'icon.png');
+    ReleasePanel.current = new ReleasePanel(panel, host);
     ReleasePanel.current.currentProjectId = context?.projectId;
+    setActiveProjectId(context?.projectId);
     return ReleasePanel.current;
   }
 
@@ -90,7 +98,7 @@ export class ReleasePanel {
     return this.host === host;
   }
 
-  private constructor(panel: vscode.WebviewPanel, private host: ReleasePanelHost, private readonly extensionUri: vscode.Uri) {
+  private constructor(panel: vscode.WebviewPanel, private host: ReleasePanelHost) {
     this.panel = panel;
     this.panel.webview.html = this.renderHtml();
 
@@ -112,8 +120,11 @@ export class ReleasePanel {
             case 'setHideServiceBranches':
               await this.host.onSetHideServiceBranches(message.hide);
               break;
-            case 'pullBranch':
-              await this.host.onPullBranch(message.branch);
+            case 'switchBranch':
+              await this.host.onSwitchBranch(message.branch);
+              break;
+            case 'pullCurrentBranch':
+              await this.host.onPullCurrentBranch();
               break;
             case 'expandBranch':
               await this.host.onExpandBranch(message.ref);
@@ -228,6 +239,7 @@ export class ReleasePanel {
 
   dispose(): void {
     ReleasePanel.current = undefined;
+    setActiveProjectId(undefined);
     this.panel.dispose();
     while (this.disposables.length) {
       this.disposables.pop()?.dispose();
@@ -235,46 +247,129 @@ export class ReleasePanel {
   }
 
   private renderHtml(): string {
-    const logoUri = this.panel.webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'icon.png'));
     return /* html */ `<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8" />
 <style>
-  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 12px; }
-  .header { display: flex; align-items: center; gap: 8px; }
-  .header img { width: 24px; height: 24px; flex: none; display: block; }
-  .header h2 { margin: 0; line-height: 24px; }
-  h3 { margin-bottom: 6px; }
-  section { margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px solid var(--vscode-panel-border); }
+  :root {
+    --qr-radius: 8px;
+    --qr-radius-sm: 5px;
+    --qr-card-bg: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+    --qr-card-border: var(--vscode-widget-border, var(--vscode-panel-border));
+    --qr-gap: 14px;
+  }
   * { box-sizing: border-box; }
-  input[type=text] { width: 100%; max-width: 260px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 4px; }
+  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 14px; }
+  /* Хедер панели — логотип + название + подпись под ним (см. renderHtml). */
+  .app-header { display: flex; align-items: center; gap: 10px; }
+  /* Инлайновый SVG, а не <img src="...icon.svg">: внешний файл-картинка рендерится браузером как
+     отдельный документ, currentColor в нём резолвится в свой дефолт (чёрный), а НЕ в цвет текста
+     страницы — из-за этого лого раньше просто не было видно на тёмной теме. Инлайновый <svg> —
+     часть той же страницы, currentColor берёт --vscode-foreground как обычный текст. */
+  .app-header svg.app-logo { width: 22px; height: 22px; flex: none; display: block; color: var(--vscode-foreground); }
+  .app-header h2 { margin: 0; line-height: 1.3; font-size: 15px; }
+  .app-subtitle { opacity: 0.7; font-size: 12px; margin: 2px 0 var(--qr-gap); }
+  h3 { margin-bottom: 6px; }
+  /* Карточка — общая "рамка" для утилитарной Git-строки наверху и каждого пронумерованного шага
+     ниже (см. .card-num) — единственная единица визуальной группировки во всей панели, вместо
+     разделителей section{border-bottom} до этого редизайна. */
+  .card { background: var(--qr-card-bg); border: 1px solid var(--qr-card-border); border-radius: var(--qr-radius); padding: 12px 14px; margin-bottom: var(--qr-gap); }
+  .git-bar { display: flex; align-items: center; gap: 10px 16px; flex-wrap: wrap; margin-bottom: var(--qr-gap); }
+  .git-bar .field-inline { display: flex; align-items: center; gap: 8px; }
+  .git-bar .field-inline label { font-size: 12px; opacity: 0.85; white-space: nowrap; }
+  .git-bar .field-inline select { min-width: 200px; }
+  .git-bar-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+  /* Заголовок карточки шага — кружок с номером (тот же порядок, что в разделах панели) + заголовок
+     и короткое пояснение под ним. card-head сама по себе не обязательно кликабельна — у
+     "Хронология коммитов" на неё же навешан collapse-toggle (см. #itemsHeader), поэтому cursor и
+     user-select там задаются отдельным классом .clickable, а не тут, чтобы остальные заголовки не
+     выглядели как кнопки, которыми не являются. */
+  .card-head { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px; }
+  .card-head.clickable { cursor: pointer; user-select: none; }
+  .card-num { display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; background: var(--vscode-button-background); color: var(--vscode-button-foreground); font-size: 12px; font-weight: 600; flex: none; margin-top: 1px; }
+  .card-head-text { flex: 1; min-width: 0; }
+  .card-title { margin: 0; font-size: 13px; font-weight: 600; }
+  .card-desc { font-size: 11px; opacity: 0.7; margin: 2px 0 0; }
+  .card-head-extra { display: flex; align-items: center; gap: 8px; flex: none; margin-top: 1px; }
+  /* Дублирует итог по конфликтам из футера хронологии (см. .chrono-summary-row) прямо в заголовке
+     карточки — виден сразу, не долистывая таблицу коммитов вниз. */
+  .conflict-summary-top { font-size: 11px; padding: 2px 8px; border-radius: 10px; display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+  .conflict-summary-top.ok { background: color-mix(in srgb, var(--vscode-charts-green) 20%, transparent); color: var(--vscode-charts-green); }
+  .conflict-summary-top.bad { background: var(--vscode-charts-red); color: #fff; }
+  /* Кнопки-действия, встроенные ПРЯМО в кликабельный заголовок карточки (Очистить, Сбросить
+     копирование, кнопка синхронизации) — иначе клик по ним сработал бы и как клик по самому
+     заголовку (см. stopPropagation в их обработчиках), поэтому визуально мельче обычных кнопок,
+     чтобы не спорить с заголовком за внимание. */
+  button.small-btn { font-size: 11px; padding: 3px 8px; margin: 0; }
+  /* Кнопка-иконка без текста (синхронизация хронологии с текущим выбором веток, см.
+     #rebuildSyncBtn) — красная, если состав/количество выбранных веток разошлось с тем, на основе
+     чего построена текущая хронология (нажатие перестраивает её), зелёная — если совпадает. */
+  button.icon-btn { background: none; padding: 2px; margin: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; }
+  button.icon-btn svg { width: 16px; height: 16px; }
+  button.icon-btn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2)); }
+  .sync-btn.sync-bad { color: var(--vscode-charts-red); }
+  .sync-btn.sync-ok { color: var(--vscode-charts-green); }
+  /* Пока идёт (пере)построение хронологии — см. setBuildPlanBusy — крутится сама иконка, а не
+     кнопка целиком (иначе hover-подсветка/фон тоже завертелись бы вместе с ней). */
+  .sync-btn.spinning svg { animation: qvarh-spin 0.8s linear infinite; }
+  /* Фиксированные цвета по явному ТЗ (а не тема-зависимые --vscode-button-*) — Pull/Создать
+     релизную ветку синие, Начать сборку зелёная, Отменить сборку красная: они настолько разные по
+     последствиям (переключение контекста / начало необратимого cherry-pick / его отмена), что
+     стоит выделить цветом сильнее, чем просто primary/secondary. */
+  .btn-blue { background: #2246a8; color: #fff; }
+  .btn-blue:hover { filter: brightness(1.15); }
+  .btn-green { background: #276839; color: #fff; }
+  .btn-green:hover { filter: brightness(1.15); }
+  .btn-red { background: #95292d; color: #fff; }
+  .btn-red:hover { filter: brightness(1.15); }
+  /* Поле поиска списка веток — иконка внутри инпута слева, текст с отступом под неё (padding-left
+     на самом input, а не просто оверлей поверх текста) — курсор и ввод начинаются ПОСЛЕ иконки, а
+     не наезжают на неё. */
+  .search-field { position: relative; display: flex; align-items: center; }
+  .search-field .search-icon { position: absolute; left: 8px; width: 14px; height: 14px; opacity: 0.6; pointer-events: none; color: var(--vscode-input-foreground); }
+  .search-field input[type=text] { padding-left: 28px; max-width: 420px; }
+  input[type=text], input[type=number], select { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: var(--qr-radius-sm); padding: 4px 6px; font-family: inherit; font-size: inherit; }
+  input[type=text] { width: 100%; max-width: 260px; }
+  select { cursor: pointer; }
   .field { margin-bottom: 8px; }
   .field label { display: block; margin-bottom: 2px; }
+  /* Модификатор для полей, где label короткий и лучше смотрится в одну строку с самим input
+     (см. "Дата релиза") — не трогает базовый .field (переносы label/input друг под другом нужны
+     там, где текст лейбла длиннее, например у фильтра — впрочем, там своя обёртка .search-field). */
+  .field.field-row { display: flex; align-items: center; gap: 8px; }
+  .field.field-row label { display: inline; margin-bottom: 0; white-space: nowrap; }
   .button-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; }
-  button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 12px; cursor: pointer; margin-right: 6px; margin-bottom: 6px; }
+  button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: var(--qr-radius-sm); padding: 6px 12px; cursor: pointer; margin-right: 6px; margin-bottom: 6px; }
   button:hover { background: var(--vscode-button-hoverBackground); }
   button.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+  button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
+  /* Разворачивание коммитов конкретной ветки в списке (см. .expand-toggle) — единственное
+     оставшееся текстовое действие-ссылка в панели: этих кнопок по одной на КАЖДУЮ строку списка
+     веток, полноценная кнопка на каждой была бы визуально слишком тяжёлой. "Показать контекстные
+     коммиты"/"Сбросить копирование" (их в панели всего по одному экземпляру) теперь настоящие
+     кнопки — см. .small-btn. */
   button.link { background: none; color: var(--vscode-textLink-foreground); padding: 0; margin: 0; text-decoration: underline; font-size: 11px; }
   .links a { color: var(--vscode-textLink-foreground); text-decoration: none; margin-right: 8px; font-size: 11px; }
   .links a:hover { text-decoration: underline; }
   /* Цвет +/- один на все контексты, где рендерится renderDiffStatInline (ссылки, автор в хронологии,
-     суммаризация внизу таблицы) — раньше был задан отдельно под каждым родительским классом и до
-     суммаризации просто не добрался (см. .chrono-summary-row ниже), из-за чего там +/- были обычным
-     текстом без цвета. Layout (расположение в строку/столбик, отступы, моноширинный шрифт) остаётся
-     свой у каждого контекста — общий только цвет. */
+     суммаризация внизу таблицы, агрегированная сводка по ветке) — раньше был задан отдельно под
+     каждым родительским классом и до суммаризации просто не добрался (см. .chrono-summary-row
+     ниже), из-за чего там +/- были обычным текстом без цвета. Layout (расположение в строку/
+     столбик, отступы, моноширинный шрифт) остаётся свой у каждого контекста — общий только цвет. */
   .diffstat-add { color: var(--vscode-charts-green); }
   .diffstat-del { color: var(--vscode-charts-red); }
   .links .diffstat { font-size: 11px; font-family: var(--vscode-editor-font-family, monospace); }
   .links .diffstat-del { margin-left: 4px; }
   button:disabled { opacity: 0.5; cursor: default; }
-  #branchList { height: 280px; min-height: 120px; resize: vertical; overflow-y: auto; overflow-x: hidden; border: 1px solid var(--vscode-panel-border); padding: 4px; margin-top: 6px; }
-  .branch-row { padding: 3px 0; border-bottom: 1px dashed var(--vscode-panel-border); }
+  /* position:relative — сам служит "холстом" для .branch-rail-overlay (см. renderBranches/
+     drawBranchRail), как #items у хронологии, но без отдельного внешнего скролл-контейнера:
+     #branchList одновременно и скроллится, и позиционирует поверх себя абсолютный SVG. */
+  #branchList { position: relative; height: 280px; min-height: 120px; resize: vertical; overflow-y: auto; overflow-x: hidden; border: 1px solid var(--qr-card-border); border-radius: var(--qr-radius-sm); margin-top: 6px; }
   .branch-row-main { display: flex; align-items: flex-start; gap: 8px; }
   .branch-row.remote .branch-name::after { content: " (remote)"; opacity: 0.5; font-size: 10px; }
-  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; margin-top: 3px; }
   .lane-label { font-size: 11px; padding: 1px 6px; border-radius: 3px; color: #000; flex: none; min-width: 90px; text-align: center; }
-  .branch-main { flex: 1; }
+  .branch-main { flex: 1; min-width: 0; }
   .sha { font-family: var(--vscode-editor-font-family); font-size: 11px; opacity: 0.8; }
   .muted { opacity: 0.7; font-size: 12px; }
   .badge { font-size: 11px; padding: 1px 6px; border-radius: 3px; margin-right: 4px; display: inline-block; margin-top: 2px; }
@@ -284,22 +379,52 @@ export class ReleasePanel {
   .badge.applied { background: var(--vscode-charts-blue); color: #fff; }
   .badge.inmain { background: var(--vscode-charts-purple, #B37FEB); color: #000; }
   .badge.partial-inmain { background: var(--vscode-charts-yellow, #E2C08D); color: #000; }
-  .chip { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); margin: 2px 4px 2px 0; }
-  #error { display: flex; align-items: flex-start; gap: 8px; color: var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); border: 1px solid var(--vscode-inputValidation-errorBorder, transparent); padding: 6px; border-radius: 3px; min-height: 1em; }
+  /* Тот же радиус, что и у кнопок (--qr-radius-sm) — раньше был отдельный "пилюльный" 10px, теперь
+     единый скруглённый стиль по всей панели (см. .cherry-sha ниже — тот же приём для sha в командах). */
+  .chip { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: var(--qr-radius-sm); background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); margin: 2px 4px 2px 0; }
+  #error { display: flex; align-items: flex-start; gap: 8px; color: var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); border: 1px solid var(--vscode-inputValidation-errorBorder, transparent); padding: 8px 10px; border-radius: var(--qr-radius-sm); min-height: 1em; margin-bottom: var(--qr-gap); }
   #errorText { white-space: pre-wrap; flex: 1; }
   #errorCloseBtn { background: none; border: none; color: inherit; cursor: pointer; padding: 0; margin: 0; font-size: 14px; line-height: 1; opacity: 0.7; }
   #errorCloseBtn:hover { opacity: 1; }
-  .branch-commits { margin: 4px 0 4px 24px; padding-left: 8px; border-left: 2px solid var(--vscode-panel-border); }
+  .branch-commits { margin: 4px 0 4px 0; padding-left: 8px; border-left: 2px solid var(--qr-card-border); }
   .branch-commit-row { font-size: 11px; padding: 2px 0; }
   .conflict-details { margin-top: 4px; padding-left: 8px; border-left: 2px solid var(--vscode-charts-red); }
   .conflict-file { font-size: 11px; padding: 2px 0; }
   .conflict-hint { font-size: 11px; padding: 3px 0; }
   .conflict-cause { font-size: 11px; padding: 2px 0 2px 8px; }
-  .git-status { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
-  .pull-row { display: flex; gap: 6px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
-  .filter-row { display: flex; gap: 10px; align-items: center; margin-top: 6px; flex-wrap: wrap; font-size: 12px; }
-  .filter-row label { display: flex; align-items: center; gap: 3px; white-space: nowrap; cursor: default; }
-  .filter-row input[type=text] { width: 56px; max-width: 56px; }
+  .filter-row { display: flex; gap: 14px; align-items: center; margin-top: 8px; flex-wrap: wrap; font-size: 12px; }
+  .limit-field { display: flex; align-items: center; gap: 6px; white-space: nowrap; cursor: default; margin-left: auto; }
+  /* Переключатель ("Показать служебные"/"Скрыть уже в main") — обычный чекбокс визуально в виде
+     пилюли-свитча (см. track/knob через ::after), а не голый нативный чекбокс: реагирует сразу же
+     (input change), никакой кнопки "Применить" тут больше нет (см. requestApplyBranchFilters). */
+  .switch { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; cursor: pointer; user-select: none; }
+  .switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .switch .track { width: 30px; height: 16px; border-radius: 8px; background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); position: relative; flex: none; transition: background-color 0.15s ease, border-color 0.15s ease; }
+  .switch .track::after { content: ''; position: absolute; top: 1px; left: 1px; width: 12px; height: 12px; border-radius: 50%; background: var(--vscode-descriptionForeground); transition: transform 0.15s ease, background-color 0.15s ease; }
+  .switch input:checked + .track { background: var(--vscode-button-background); border-color: var(--vscode-button-background); }
+  .switch input:checked + .track::after { transform: translateX(14px); background: var(--vscode-button-foreground); }
+  .switch input:focus-visible + .track { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+  /* Список веток — та же табличная подача, что и у хронологии (см. .chrono-grid-row): узкая
+     колонка-"рельс" слева с прямой линией СВОЕГО цвета на каждую ветку (см. drawBranchRail —
+     без ветвлений/слияний, это просто визуальная привязка к цвету, а не настоящий граф), затем
+     контент ветки, затем агрегированный +/- "за базой" (см. BranchDiffStat в types.ts) в узкой
+     колонке справа — статус "в main" здесь НЕ отдельная колонка, он остаётся бейджем рядом с
+     именем ветки, как и раньше. */
+  .branch-grid-row { display: grid; grid-template-columns: 22px minmax(160px, 1fr) 84px; column-gap: 0; align-items: stretch; }
+  .branch-row { padding: 5px 0; border-bottom: 1px dashed var(--qr-card-border); }
+  .branch-row:last-child { border-bottom: none; }
+  .branch-header-row { border-bottom: 1px solid var(--qr-card-border); padding-bottom: 4px; margin-bottom: 2px; }
+  .col-branch-info { padding: 0 8px; min-width: 0; }
+  .col-branch-diffstat { padding: 3px 8px; text-align: right; }
+  .col-branch-diffstat .diffstat { display: inline-flex; flex-direction: column; gap: 1px; font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; }
+  .col-branch-diffstat .muted { display: block; font-size: 10px; }
+  /* .inline-loading (см. выше) — блочный flex, а не inline-flex, поэтому text-align:right ячейки
+     на его позицию не влияет (блочный бокс всегда на всю ширину) — выравниваем спиннер вручную. */
+  .col-branch-diffstat .inline-loading { justify-content: flex-end; }
+  .branch-rail-spacer { position: relative; }
+  /* Отдельный от хронологии SVG-оверлей (см. .rail-overlay выше — тот НЕ трогаем, это его
+     упрощённая версия без лейнов/слияний специально для списка веток, см. drawBranchRail). */
+  .branch-rail-overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
   .branch-list-loading, .inline-loading { display: flex; align-items: center; gap: 6px; }
   .branch-list-loading { padding: 8px 0; }
   .branch-list-loading::before, .inline-loading::before {
@@ -308,9 +433,11 @@ export class ReleasePanel {
     animation: qvarh-spin 0.8s linear infinite;
   }
   @keyframes qvarh-spin { to { transform: rotate(360deg); } }
-  .chip-remove { background: none; border: none; color: inherit; cursor: pointer; padding: 0 0 0 4px; margin: 0; font-size: 12px; }
-  .section-header { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
-  .section-header .collapse-arrow { font-size: 10px; opacity: 0.7; width: 10px; display: inline-block; }
+  /* Фиксированный квадратный бокс с flex-центрированием — раньше был несимметричный padding
+     (0 0 0 4px) без явных width/height, из-за чего рамка наведения браузера обрамляла
+     несимметричный бокс, а "×" внутри неё съезжал вправо, а не в центр. */
+  .chip-remove { background: none; border: none; color: inherit; cursor: pointer; padding: 0; margin: 0 0 0 4px; font-size: 12px; width: 14px; height: 14px; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; }
+  .card-head .collapse-arrow { font-size: 10px; opacity: 0.7; width: 10px; display: inline-block; text-align: center; }
   .collapsible-body.collapsed { display: none; }
   /* "Rail" — дорожки веток слева от хронологии (см. renderItems/computeRail/drawRail): dev-"ствол"
      (лейн 0) и по одной дорожке на каждую показанную ветку, шириной RAIL_LANE_W каждая — фиксированный
@@ -386,11 +513,14 @@ export class ReleasePanel {
   .rail-overlay .rail-line.rail-hot { stroke-width: 3.5; }
   .stale-branches { margin-top: 8px; }
   .stale-branch-row { font-size: 11px; padding: 3px 0; border-bottom: 1px dashed var(--vscode-panel-border); }
+  .stale-add-btn { background: var(--vscode-charts-green); color: #000; border: none; border-radius: 50%; width: 16px; height: 16px; line-height: 16px; padding: 0; margin: 0 2px; font-size: 12px; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
+  .stale-add-btn:hover { filter: brightness(1.15); }
+  /* Уже добавлена в выбор (см. updateStaleAddButtons) — приглушённая, без cursor:pointer намёка на кликабельность. */
+  .stale-add-btn.added, .stale-add-btn:disabled { background: transparent; color: var(--vscode-charts-green); cursor: default; opacity: 0.8; }
+  .stale-add-btn.added:hover, .stale-add-btn:disabled:hover { filter: none; }
   .stale-branches-controls { margin-bottom: 4px; }
   .stale-branches-controls input[type="number"] { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 2px; padding: 1px 4px; }
-  .cherry-pick-section { margin-top: 10px; }
-  .section-header-static { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
-  .cherry-cmd { margin-bottom: 10px; padding: 6px 8px; border: 1px solid var(--vscode-panel-border); border-radius: 3px; }
+  .cherry-cmd { margin-bottom: 10px; padding: 6px 8px; border: 1px solid var(--qr-card-border); border-radius: var(--qr-radius-sm); }
   .cherry-cmd-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
   .cherry-cmd-label { font-size: 11px; opacity: 0.75; }
   .cherry-cmd-body { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; line-height: 2; word-break: break-word; }
@@ -398,7 +528,7 @@ export class ReleasePanel {
   /* Каждый sha — цветной "чип", как .lane-label в хронологии: тот же colorFor(branch), чтобы
      совпадало визуально. У конфликтного — фон красный (как .badge.conflict), а обводка — в цвет
      ветки, чтобы не терять связь с веткой даже когда фон перекрыт цветом конфликта. */
-  .cherry-sha { display: inline-block; padding: 1px 6px; margin: 1px 3px 1px 0; border-radius: 10px; color: #000; text-decoration: none; border: 2px solid transparent; font-size: 11px; cursor: pointer; }
+  .cherry-sha { display: inline-block; padding: 1px 6px; margin: 1px 3px 1px 0; border-radius: var(--qr-radius-sm); color: #000; text-decoration: none; border: 2px solid transparent; font-size: 11px; cursor: pointer; }
   .cherry-sha:hover { filter: brightness(1.12); text-decoration: underline; }
   .cherry-sha.conflict { background: var(--vscode-charts-red) !important; color: #fff; }
   /* Состояние "уже скопировано" — блёклый текст, чтобы не запутаться, какую команду уже брали. */
@@ -406,65 +536,107 @@ export class ReleasePanel {
 </style>
 </head>
 <body>
-  <div class="header">
-    <img src="${logoUri}" alt="" />
+  <div class="app-header">
+    <svg class="app-logo" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M4 3 L4 13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/>
+      <path d="M4 6.2 C7 6.2 7 8 11 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/>
+      <circle cx="4" cy="3" r="1.6" fill="currentColor"/>
+      <circle cx="4" cy="13" r="1.6" fill="currentColor"/>
+      <circle cx="12" cy="8" r="1.6" fill="currentColor"/>
+    </svg>
     <h2>Qvarh Release Builder</h2>
   </div>
-  <div class="muted" style="margin-bottom:10px;">Git: локальный релиз по выбранным коммитам</div>
+  <div class="app-subtitle">Сборка, проверка и выпуск релизов из локальных веток</div>
 
   <div id="error" style="display:none;">
     <span id="errorText"></span>
     <button id="errorCloseBtn" title="Закрыть">×</button>
   </div>
 
-  <section>
-    <div class="git-status">
-      <div>Текущая ветка: <b id="currentBranchName">…</b></div>
-      <div>Основная ветка (для релиза): <b id="mainBranchName">…</b></div>
-      <button id="refreshBtn" class="secondary">Обновить список веток</button>
+  <div class="card git-bar">
+    <div class="field-inline">
+      <label for="currentBranchSelect">Текущая ветка</label>
+      <select id="currentBranchSelect"><option value="">…</option></select>
     </div>
-    <div class="pull-row">
-      <label>Pull ветку:</label>
-      <input type="text" id="pullBranchInput" list="branchNamesList" placeholder="имя основной или dev-ветки" />
-      <datalist id="branchNamesList"></datalist>
-      <button id="pullBtn" class="secondary">Pull (checkout + pull)</button>
+    <div class="git-bar-actions">
+      <button id="pullBtn" class="btn-blue" title="git pull для уже выбранной (текущей) ветки — переключиться на другую ветку можно селектом слева">Pull</button>
     </div>
-  </section>
+  </div>
 
-  <section>
-    <h3>Ветки</h3>
+  <section class="card">
+    <div class="card-head clickable" id="branchesHeader">
+      <span class="card-num">1</span>
+      <div class="card-head-text">
+        <h3 class="card-title">Выберите ветки для релиза</h3>
+        <div class="card-desc">Отметьте ветки, которые хотите включить в релиз.</div>
+      </div>
+      <div class="card-head-extra">
+        <button id="refreshBtn" class="secondary small-btn">Обновить список веток</button>
+        <span class="collapse-arrow" id="branchesArrow">▾</span>
+      </div>
+    </div>
+    <div class="collapsible-body" id="branchesBody">
     <div class="field">
-      <label>Фильтр (по названию ветки, через пробел — несколько сразу):</label>
-      <input type="text" id="branchFilter" placeholder="PROJ-123 PROJ-456" />
+      <div class="search-field">
+        <svg class="search-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.5" cy="6.5" r="4.5" stroke="currentColor" stroke-width="1.4" fill="none"/><line x1="10" y1="10" x2="14" y2="14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        <input type="text" id="branchFilter" placeholder="Фильтр по названию ветки, через пробел — несколько сразу" />
+      </div>
     </div>
     <div class="filter-row">
-      <label title="Применяется вместе с лимитом показа по кнопке «Применить» — скрытие происходит ДО среза по лимиту"><input type="checkbox" id="hideInMainFilter" /> Скрыть в <span id="hideInMainFilterBranchName">main</span></label>
-      <label title="Скрыть qa, revert-pr-, chore/ и т.п. — см. настройку «Префиксы служебных веток». Применяется сразу"><input type="checkbox" id="hideServiceBranchesFilter" /> Скрыть служебные</label>
-      <label>Показывать: <input type="text" id="branchListLimitInput" inputmode="numeric" pattern="[0-9]*" /></label>
-      <button id="branchListLimitBtn" class="secondary" title="Применяет флажок «Скрыть в main» и лимит показа вместе">Применить</button>
+      <label class="switch" title="Скрывает ветки, уже полностью выпущенные — проверка идёт git-запросом, поэтому реагирует не мгновенно">
+        <input type="checkbox" id="hideInMainFilter" /><span class="track"></span> Скрыть уже в <span id="hideInMainFilterBranchName">main</span>
+      </label>
+      <label class="switch" title="qa, revert-pr-, chore/ и т.п. — см. настройку «Префиксы служебных веток»; по умолчанию скрыты">
+        <input type="checkbox" id="hideServiceBranchesFilter" /><span class="track"></span> Показать служебные
+      </label>
+      <label class="limit-field">Показывать
+        <select id="branchListLimitInput">
+          <option value="25">25</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="200">200</option>
+          <option value="500">500</option>
+          <option value="1000000">Все</option>
+        </select>
+      </label>
     </div>
-    <div id="branchListInfo" class="muted">Загрузка списка веток…</div>
-    <label style="display:inline-block; margin:4px 0;" title="Выбирает/снимает выбор со всех веток, показанных ниже — то есть с учётом текущего фильтра, а не вообще всех веток репозитория">
+    <div id="branchListInfo" class="muted" style="margin-top:6px;">Загрузка списка веток…</div>
+    <label style="display:inline-block; margin:6px 0;" title="Выбирает/снимает выбор со всех веток, показанных ниже — то есть с учётом текущего фильтра, а не вообще всех веток репозитория">
       <input type="checkbox" id="selectAllVisibleBranches" /> Выбрать все
     </label>
+    <div id="branchListHeaderRow" class="branch-grid-row branch-header-row" style="display:none;">
+      <div class="branch-rail-spacer"></div>
+      <div class="chrono-cell chrono-header-cell">Ветка и последний коммит</div>
+      <div class="chrono-cell chrono-header-cell" style="text-align:right;">Изменения</div>
+    </div>
     <div id="branchList"><div class="muted branch-list-loading">Загрузка веток…</div></div>
     <div id="selectedSummary" class="muted" style="margin-top:6px;"></div>
 
     <div class="button-row">
       <button id="buildPlanBtn">Построить хронологию выбранных веток</button>
-      <button id="clearPlanBtn" class="secondary">Очистить</button>
     </div>
-    <div class="muted" style="margin-top:2px;">Проверка на конфликты запускается автоматически сразу после построения хронологии.</div>
+    </div>
   </section>
 
-  <section>
-    <div class="section-header" id="itemsHeader">
-      <span class="collapse-arrow" id="itemsArrow">▾</span>
-      <h3 style="margin:0;">Хронология коммитов</h3>
+  <section class="card">
+    <div class="card-head clickable" id="itemsHeader">
+      <span class="card-num">2</span>
+      <div class="card-head-text">
+        <h3 class="card-title">Хронология коммитов</h3>
+        <div class="card-desc">Проверьте порядок коммитов перед сборкой релиза.</div>
+      </div>
+      <div class="card-head-extra">
+        <button id="rebuildSyncBtn" class="icon-btn sync-btn" style="display:none;" title="Выбор веток изменился с последней сборки хронологии — нажмите, чтобы перестроить">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 3v3.5h-3.5M3 13v-3.5h3.5" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M3.5 8a4.5 4.5 0 0 1 7.6-3.2l1.9 1.7M12.5 8a4.5 4.5 0 0 1-7.6 3.2l-1.9-1.7" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <span id="conflictSummaryTop"></span>
+        <button id="clearPlanBtn" class="secondary small-btn">Очистить</button>
+        <span class="collapse-arrow" id="itemsArrow">▾</span>
+      </div>
     </div>
     <div class="collapsible-body" id="itemsBody">
       <div class="button-row" style="margin-top:0;">
-        <button id="toggleContextBtn" class="link" style="display:none;"></button>
+        <button id="toggleContextBtn" class="secondary small-btn" style="display:none;"></button>
       </div>
       <div id="staleBranches" class="stale-branches"></div>
       <div id="chronoScroll" class="chrono-scroll">
@@ -480,42 +652,54 @@ export class ReleasePanel {
           <div id="chronoSummaryRow" class="chrono-summary-row"></div>
         </div>
       </div>
-      <div id="cherryPickSection" class="cherry-pick-section" style="display:none;">
-        <div class="section-header-static">
-          <h4 style="margin:0;">Команда для ручного cherry-pick</h4>
-          <button id="resetCopiedBtn" class="link">Сбросить состояние копирования</button>
-        </div>
-        <div class="muted" style="margin:2px 0 6px;">
-          В порядке хронологии; на каждом конфликтном коммите (обводка цвета его ветки) команда обрывается — примените её,
-          разрешите конфликт, затем скопируйте и выполните следующую.
-        </div>
-        <div id="cherryPickCommands"></div>
-      </div>
     </div>
   </section>
 
-  <section>
-    <h3>Сборка релизной ветки</h3>
-    <div class="field">
+  <section class="card" id="cherryPickSection" style="display:none;">
+    <div class="card-head clickable" id="cherryPickHeader">
+      <span class="card-num">3</span>
+      <div class="card-head-text">
+        <h3 class="card-title">Команда для ручного cherry-pick</h3>
+      </div>
+      <div class="card-head-extra">
+        <button id="resetCopiedBtn" class="secondary small-btn">Сбросить состояние копирования</button>
+        <span class="collapse-arrow" id="cherryPickArrow">▾</span>
+      </div>
+    </div>
+    <div class="collapsible-body" id="cherryPickBody">
+    <div id="cherryPickCommands"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head clickable" id="buildHeader">
+      <span class="card-num">4</span>
+      <div class="card-head-text">
+        <h3 class="card-title">Сборка релизной ветки</h3>
+      </div>
+      <div class="card-head-extra">
+        <span class="collapse-arrow" id="buildArrow">▾</span>
+      </div>
+    </div>
+    <div class="collapsible-body" id="buildBody">
+    <div class="field field-row">
       <label>Дата релиза (для имени релизной ветки):</label>
       <input type="text" id="releaseDate" />
     </div>
     <div class="button-row">
-      <button id="createBranchBtn">Создать релизную ветку</button>
+      <button id="createBranchBtn" class="btn-blue">Создать релизную ветку</button>
       <span class="muted" id="releaseBranchStatus"></span>
     </div>
     <div class="muted" id="releaseBranchInfo"></div>
 
-    <div class="muted" style="margin-top:10px;">
-      «Начать сборку» применяет отмеченные коммиты (cherry-pick) один за другим в хронологическом порядке, пока не закончит или не встретит конфликт. Если возник конфликт — разрешите его в файлах репозитория (как обычный конфликт merge/rebase) и нажмите «Начать сборку» ещё раз: сборка сама продолжит с того же места, отдельной кнопки для этого не нужно.
-    </div>
-    <div class="button-row" style="margin-top:4px;">
-      <button id="startBtn" disabled>Начать сборку</button>
-      <button id="abortBtn" class="secondary">Отменить сборку (cherry-pick --abort)</button>
+    <div class="button-row" style="margin-top:10px;">
+      <button id="startBtn" disabled class="btn-green">Начать сборку</button>
+      <button id="abortBtn" class="btn-red">Отменить сборку</button>
     </div>
     <div id="buildStatus" class="muted" style="margin-top:4px;"></div>
     <div class="button-row" id="publishRow" style="display:none; margin-top:10px;">
       <button id="publishBtn">Опубликовать релизную ветку</button>
+    </div>
     </div>
   </section>
 
@@ -669,18 +853,50 @@ export class ReleasePanel {
     const el = document.getElementById('selectedSummary');
     if (selectedRefs.size === 0) {
       el.textContent = 'Ветки не выбраны';
+    } else {
+      el.innerHTML = 'Выбрано: ' + [...selectedRefs].map((ref) => {
+        const name = branchNameByRef.get(ref) || ref;
+        // Цвет чипа — тот же colorFor(name), что и у дорожки ветки на графе, чтобы выбор в списке и
+        // сама хронология были визуально связаны (см. .cherry-sha — тот же приём для sha в командах).
+        return \`<span class="chip" style="background:\${colorFor(name)};color:#000;">\${name} <button class="chip-remove" data-ref="\${ref}" title="Убрать из выбора">×</button></span>\`;
+      }).join('');
+
+      [...el.querySelectorAll('.chip-remove')].forEach((btn) => {
+        btn.addEventListener('click', (e) => deselectBranch(e.target.dataset.ref));
+      });
+    }
+    updateSyncIndicator();
+    updateStaleAddButtons();
+  }
+
+  // "Синхронизация" хронологии с текущим выбором веток (см. #rebuildSyncBtn в card-head
+  // "Хронология коммитов") — сравнение по ИМЕНАМ веток (а не refs), потому что именно имена
+  // реально лежат в уже построенном plan.items; зелёная — состав совпадает, красная — выбор с
+  // последней сборки хронологии успел измениться (клик перестраивает, как "Построить хронологию").
+  function computeSyncState() {
+    if (!currentPlan) return null;
+    const planBranches = new Set(currentPlan.items.map((i) => i.branch));
+    const selectedBranches = new Set([...selectedRefs].map((ref) => branchNameByRef.get(ref) || ref));
+    if (planBranches.size !== selectedBranches.size) return false;
+    for (const b of planBranches) {
+      if (!selectedBranches.has(b)) return false;
+    }
+    return true;
+  }
+
+  function updateSyncIndicator() {
+    const btn = document.getElementById('rebuildSyncBtn');
+    const inSync = computeSyncState();
+    if (inSync === null) {
+      btn.style.display = 'none';
       return;
     }
-    el.innerHTML = 'Выбрано: ' + [...selectedRefs].map((ref) => {
-      const name = branchNameByRef.get(ref) || ref;
-      // Цвет чипа — тот же colorFor(name), что и у дорожки ветки на графе, чтобы выбор в списке и
-      // сама хронология были визуально связаны (см. .cherry-sha — тот же приём для sha в командах).
-      return \`<span class="chip" style="background:\${colorFor(name)};color:#000;">\${name} <button class="chip-remove" data-ref="\${ref}" title="Убрать из выбора">×</button></span>\`;
-    }).join('');
-
-    [...el.querySelectorAll('.chip-remove')].forEach((btn) => {
-      btn.addEventListener('click', (e) => deselectBranch(e.target.dataset.ref));
-    });
+    btn.style.display = '';
+    btn.classList.toggle('sync-bad', !inSync);
+    btn.classList.toggle('sync-ok', inSync);
+    btn.title = inSync
+      ? 'Хронология соответствует текущему выбору веток'
+      : 'Выбор веток изменился с последней сборки хронологии — нажмите, чтобы перестроить';
   }
 
   function renderBranchCommits(ref) {
@@ -700,33 +916,69 @@ export class ReleasePanel {
     \`).join('') + truncatedNote + '</div>';
   }
 
+  // Прямая линия своего цвета на каждую ветку в списке (см. .branch-rail-overlay в CSS) — НЕ тот
+  // же граф, что в хронологии (там реальные лейны/ветвления/слияния, см. computeRail/drawRail):
+  // тут просто одна дорожка на весь список, без разбора кто от кого ветвился, только чтобы цвет
+  // ветки был виден сразу слева, как визуальная привязка к остальным местам с тем же colorFor.
+  // Каждый сегмент между двумя соседними точками красится в цвет НИЖНЕЙ (более новой) ветки.
+  function drawBranchRail(branchNames, rowCenters) {
+    const x = 11;
+    const r = 4;
+    const lines = [];
+    const dots = [];
+    branchNames.forEach((name, idx) => {
+      const color = colorFor(name);
+      if (idx > 0) {
+        lines.push(\`<line x1="\${x}" y1="\${rowCenters[idx - 1]}" x2="\${x}" y2="\${rowCenters[idx]}" stroke="\${color}" stroke-width="2" />\`);
+      }
+      dots.push(\`<circle cx="\${x}" cy="\${rowCenters[idx]}" r="\${r}" fill="\${color}" />\`);
+    });
+    return lines.join('') + dots.join('');
+  }
+
+  let branchRailRenderGeneration = 0;
+  let branchRailResizeObserver = null;
+
   function renderBranches() {
+    const myGeneration = ++branchRailRenderGeneration;
+    if (branchRailResizeObserver) {
+      branchRailResizeObserver.disconnect();
+      branchRailResizeObserver = null;
+    }
     // "Скрыть уже в main" применяется на сервере ДО среза по лимиту (см. session.ts
     // sendBranchSlice) — сюда уже приходит нужный список, дополнительно фильтровать не нужно.
     const el = document.getElementById('branchList');
-    el.innerHTML = currentBranches.map((b) => {
+    document.getElementById('branchListHeaderRow').style.display = currentBranches.length > 0 ? '' : 'none';
+    el.innerHTML = '<div class="branch-rail-overlay" id="branchRailOverlay"></div>' + (currentBranches.map((b) => {
       const expanded = expandedRefs.has(b.ref);
       const status = effectiveMainStatus(b.ref, b.mainStatus);
       // Агрегированный diffstat досчитывается фоном ПОСЛЕ самого списка (см. branchDiffStatByRef
-      // выше) — сливаем в отдельный объект для renderLinks, а не мутируем b из currentBranches.
-      const diffStat = branchDiffStatByRef.get(b.ref);
-      const linksEntity = diffStat ? Object.assign({}, b, diffStat) : b;
+      // выше) — своя колонка "Изменения" справа (см. .col-branch-diffstat), а не часть строки со
+      // ссылками (includeDiffStat=false), как раньше. .has(), а не просто .get() || {} — нужно
+      // отличить "уже посчитано, изменений реально 0" (пустая ячейка) от "фон ещё не досчитал"
+      // (спиннер), иначе спиннер держался бы только на нулевых ветках вечно.
+      const diffStatCell = branchDiffStatByRef.has(b.ref)
+        ? renderDiffStatInline(branchDiffStatByRef.get(b.ref))
+        : '<span class="inline-loading"></span>';
       return \`
-      <div class="branch-row \${b.isRemote ? 'remote' : ''}">
-        <div class="branch-row-main">
-          <input type="checkbox" class="branch-check" data-ref="\${b.ref}" \${selectedRefs.has(b.ref) ? 'checked' : ''} />
-          <span class="dot" style="background:\${colorFor(b.name)}"></span>
-          <div class="branch-main">
-            <div><span class="branch-name">\${b.name}</span> \${mainStatusBadge(status)}</div>
-            <div class="muted sha">\${b.lastCommitSha ? b.lastCommitSha.slice(0,8) : ''} · \${formatDate(b.lastCommitDate)} · \${b.lastCommitAuthor} · \${b.lastCommitSubject}</div>
-            \${renderLinks(linksEntity)}
-            <button class="link expand-toggle" data-ref="\${b.ref}">\${expanded ? '▾ скрыть коммиты' : \`▸ показать коммиты (относительно \${configDevBranch}-ветки)\`}</button>
-            \${expanded ? renderBranchCommits(b.ref) : ''}
+      <div class="branch-grid-row branch-row \${b.isRemote ? 'remote' : ''}">
+        <div class="branch-rail-spacer"></div>
+        <div class="chrono-cell col-branch-info">
+          <div class="branch-row-main">
+            <input type="checkbox" class="branch-check" data-ref="\${b.ref}" \${selectedRefs.has(b.ref) ? 'checked' : ''} />
+            <div class="branch-main">
+              <div><span class="branch-name">\${b.name}</span> \${mainStatusBadge(status)}</div>
+              <div class="muted sha">\${b.lastCommitSha ? b.lastCommitSha.slice(0,8) : ''} · \${formatDate(b.lastCommitDate)} · \${b.lastCommitAuthor} · \${b.lastCommitSubject}</div>
+              \${renderLinks(b, false)}
+              <button class="link expand-toggle" data-ref="\${b.ref}">\${expanded ? '▾ скрыть коммиты' : \`▸ показать коммиты (относительно \${configDevBranch}-ветки)\`}</button>
+              \${expanded ? renderBranchCommits(b.ref) : ''}
+            </div>
           </div>
         </div>
+        <div class="chrono-cell col-branch-diffstat">\${diffStatCell}</div>
       </div>
     \`;
-    }).join('') || \`<div class="muted">Ничего не найдено (проверьте фильтр или флажок "Скрыть уже в \${configMainBranch}")</div>\`;
+    }).join('') || \`<div class="muted" style="padding:6px 8px;">Ничего не найдено (проверьте фильтр или переключатели выше)</div>\`);
 
     [...el.querySelectorAll('.branch-check')].forEach((cb) => {
       cb.addEventListener('change', (e) => {
@@ -756,6 +1008,39 @@ export class ReleasePanel {
     // репозитория — отмечен, только если ВСЕ показанные сейчас строки выбраны.
     document.getElementById('selectAllVisibleBranches').checked =
       currentBranches.length > 0 && currentBranches.every((b) => selectedRefs.has(b.ref));
+
+    // Тот же приём, что и в drawRailNow хронологии (см. ниже, renderItems): координаты по
+    // офсетам реально отрендеренных строк, а не подгонка под фиксированную высоту — перенос текста
+    // темы/имени ветки на несколько строк не ломает линию. #branchList сам скроллится и сам же
+    // position:relative — оверлей — просто первый ребёнок, а не отдельный внешний контейнер.
+    const drawBranchRailNow = () => {
+      if (myGeneration !== branchRailRenderGeneration) return;
+      const rowEls = [...el.querySelectorAll('.branch-row')];
+      if (rowEls.length === 0) return;
+      const rowCenters = rowEls.map((r) => r.offsetTop + r.offsetHeight / 2);
+      const branchNames = currentBranches.map((b) => b.name);
+      const overlay = document.getElementById('branchRailOverlay');
+      if (!overlay) return;
+      const containerHeight = el.scrollHeight;
+      overlay.style.width = '22px';
+      overlay.style.height = containerHeight + 'px';
+      overlay.innerHTML = \`<svg width="22" height="\${containerHeight}" style="overflow:visible">\${drawBranchRail(branchNames, rowCenters)}</svg>\`;
+    };
+    drawBranchRailNow();
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(drawBranchRailNow);
+    }
+    if (typeof ResizeObserver !== 'undefined') {
+      let resizeFrame = null;
+      branchRailResizeObserver = new ResizeObserver(() => {
+        if (resizeFrame !== null) return;
+        resizeFrame = requestAnimationFrame(() => {
+          resizeFrame = null;
+          drawBranchRailNow();
+        });
+      });
+      branchRailResizeObserver.observe(el);
+    }
   }
 
   // Статический чекбокс (часть HTML-шаблона, не перерисовывается) — слушатель навешивается один
@@ -770,9 +1055,22 @@ export class ReleasePanel {
     renderBranches();
   });
 
-  function renderBranchNamesList() {
-    document.getElementById('branchNamesList').innerHTML = currentBranches.map((b) => \`<option value="\${b.name}">\`).join('');
+  // Список опций селекта "Текущая ветка" — из того же currentBranches (уже отфильтрованный/
+  // урезанный лимитом срез с сервера, см. session.ts sendBranchSlice), что и раньше питал datalist
+  // свободного текстового поля "Pull ветку". Реальный ТЕКУЩИЙ checkout (currentBranchValue, см.
+  // 'currentBranch' ниже) и настроенная основная/dev ветка гарантированно попадают в список, даже
+  // если их не видно в текущем срезе (иначе выбор мог бы "потерять" ветку, на которой мы стоим).
+  let currentBranchValue = '';
+  function renderCurrentBranchSelect() {
+    const names = new Set(currentBranches.map((b) => b.name));
+    [currentBranchValue, configMainBranch, configDevBranch].forEach((n) => n && names.add(n));
+    const select = document.getElementById('currentBranchSelect');
+    select.innerHTML = [...names].sort().map((n) => \`<option value="\${escapeHtml(n)}"\${n === currentBranchValue ? ' selected' : ''}>\${escapeHtml(n)}</option>\`).join('');
   }
+  document.getElementById('currentBranchSelect').addEventListener('change', (e) => {
+    showError('');
+    vscode.postMessage({ command: 'switchBranch', branch: e.target.value });
+  });
 
   let filterDebounce = null;
   document.getElementById('branchFilter').addEventListener('input', (e) => {
@@ -784,32 +1082,26 @@ export class ReleasePanel {
     document.getElementById('branchListInfo').innerHTML = '<span class="inline-loading">Поиск…</span>';
     filterDebounce = setTimeout(() => vscode.postMessage({ command: 'filterBranches', query }), 150);
   });
-  // Только цифры — не полагаемся на type="number" (в нём по-прежнему можно набрать "e", "+", "-", ".")
-  document.getElementById('branchListLimitInput').addEventListener('input', (e) => {
-    const digitsOnly = e.target.value.replace(/[^0-9]/g, '');
-    if (digitsOnly !== e.target.value) e.target.value = digitsOnly;
-  });
-  function setBranchListLimitBusy(busy) {
-    const btn = document.getElementById('branchListLimitBtn');
-    btn.disabled = busy;
-    btn.innerHTML = busy ? '<span class="inline-loading">Применяем…</span>' : 'Применить';
-  }
-  // Чекбокс "скрыть уже в main" и лимит показа применяются ВМЕСТЕ, одним действием — фильтрация
-  // по main теперь серверная и должна происходить ДО среза по лимиту (см. session.ts
-  // sendBranchSlice), поэтому мгновенного эффекта у одного чекбокса больше нет.
-  document.getElementById('branchListLimitBtn').addEventListener('click', () => {
+  // "Скрыть уже в main" и лимит показа применяются ВМЕСТЕ, одним вызовом (см. session.ts
+  // sendBranchSlice) — но теперь оба реактивны, без кнопки "Применить": лимит — обычный select с
+  // пресетами (сам по себе дискретный, debounce не нужен), "скрыть в main" и служебные — переключатели,
+  // тоже дискретные события change, а не непрерывный ввод текста.
+  function applyBranchFilters() {
     const limit = parseInt(document.getElementById('branchListLimitInput').value, 10);
-    if (!limit || limit <= 0) return;
     const hideAlreadyInMain = document.getElementById('hideInMainFilter').checked;
     showError('');
-    setBranchListLimitBusy(true);
+    document.getElementById('branchListInfo').innerHTML = '<span class="inline-loading">Обновление списка веток…</span>';
     vscode.postMessage({ command: 'setBranchListLimit', limit, hideAlreadyInMain });
-  });
-  // В отличие от "скрыть уже в main" (нужен git-вызов, поэтому по кнопке "Применить"), это просто
-  // проверка префикса имени — дёшево, применяется сразу же при переключении чекбокса.
+  }
+  document.getElementById('branchListLimitInput').addEventListener('change', applyBranchFilters);
+  document.getElementById('hideInMainFilter').addEventListener('change', applyBranchFilters);
+  // В отличие от "скрыть уже в main" (нужен git-вызов), это просто проверка префикса имени —
+  // дёшево, применяется сразу же при переключении. Переключатель называется "Показать служебные"
+  // (позитивная формулировка, включён = показаны), а сообщению на сервер всё ещё нужен hide —
+  // поэтому здесь инвертируем.
   document.getElementById('hideServiceBranchesFilter').addEventListener('change', (e) => {
     document.getElementById('branchListInfo').innerHTML = '<span class="inline-loading">Обновление списка веток…</span>';
-    vscode.postMessage({ command: 'setHideServiceBranches', hide: e.target.checked });
+    vscode.postMessage({ command: 'setHideServiceBranches', hide: !e.target.checked });
   });
   function setRefreshBusy(busy) {
     const btn = document.getElementById('refreshBtn');
@@ -819,10 +1111,11 @@ export class ReleasePanel {
   function setPullBusy(busy) {
     const btn = document.getElementById('pullBtn');
     btn.disabled = busy;
-    btn.innerHTML = busy ? '<span class="inline-loading">Pull…</span>' : 'Pull (checkout + pull)';
+    btn.innerHTML = busy ? '<span class="inline-loading">Pull…</span>' : 'Pull';
   }
 
-  document.getElementById('refreshBtn').addEventListener('click', () => {
+  document.getElementById('refreshBtn').addEventListener('click', (e) => {
+    e.stopPropagation(); // кнопка теперь внутри кликабельного заголовка карточки "Ветки"
     document.getElementById('branchListInfo').innerHTML = '<span class="inline-loading">Обновление списка веток…</span>';
     setRefreshBusy(true);
     vscode.postMessage({ command: 'refreshBranches' });
@@ -836,12 +1129,12 @@ export class ReleasePanel {
         'Список веток долго не появляется. Если в репозитории очень много веток, это может занять время — подождите, либо уменьшите лимит в настройках.';
     }
   }, 8000);
+  // Переключение на другую ветку — отдельным селектом "Текущая ветка" выше (checkout только там).
+  // Pull здесь применяется к уже выбранной ветке, без параметра имени и без checkout.
   document.getElementById('pullBtn').addEventListener('click', () => {
     showError('');
-    const branch = document.getElementById('pullBranchInput').value.trim();
-    if (!branch) return;
     setPullBusy(true);
-    vscode.postMessage({ command: 'pullBranch', branch });
+    vscode.postMessage({ command: 'pullCurrentBranch' });
   });
 
   function setBuildPlanBusy(busy) {
@@ -850,33 +1143,72 @@ export class ReleasePanel {
     // Dry-run теперь запускается автоматически сразу после построения хронологии — один и тот же
     // busy-статус кнопки покрывает оба шага, отдельного индикатора для dry-run больше не нужно.
     btn.innerHTML = busy ? '<span class="inline-loading">Строим хронологию и проверяем конфликты…</span>' : 'Построить хронологию выбранных веток';
+    // Пока строится (или перестраивается) хронология, иконка синхронизации крутится — тот же
+    // сигнал "идёт работа", что и спиннер на кнопке, но там, где реально смотрят в процессе
+    // перестроения (рядом с "Конфликты"), а не только на самой кнопке ниже.
+    document.getElementById('rebuildSyncBtn').classList.toggle('spinning', busy);
   }
 
-  document.getElementById('buildPlanBtn').addEventListener('click', () => {
+  function requestBuildPlan() {
     showError('');
     setBuildPlanBusy(true);
     vscode.postMessage({ command: 'buildPlan', selectedRefs: [...selectedRefs] });
+  }
+  document.getElementById('buildPlanBtn').addEventListener('click', requestBuildPlan);
+  document.getElementById('rebuildSyncBtn').addEventListener('click', (e) => {
+    e.stopPropagation(); // внутри кликабельного заголовка карточки, см. wireCollapsibleCard
+    requestBuildPlan();
   });
 
-  document.getElementById('clearPlanBtn').addEventListener('click', () => {
+  document.getElementById('clearPlanBtn').addEventListener('click', (e) => {
+    e.stopPropagation(); // кнопка теперь внутри кликабельного заголовка карточки — иначе клик ещё и свернул/развернул бы её
     showError('');
     vscode.postMessage({ command: 'clearPlan' });
   });
 
-  let itemsCollapsed = false;
-  document.getElementById('itemsHeader').addEventListener('click', () => {
-    itemsCollapsed = !itemsCollapsed;
-    document.getElementById('itemsBody').classList.toggle('collapsed', itemsCollapsed);
-    document.getElementById('itemsArrow').textContent = itemsCollapsed ? '▸' : '▾';
-  });
+  // Каждый пронумерованный блок сворачивается точно так же, как раньше умела только "Хронология
+  // коммитов" (см. itemsHeader) — общий обработчик вместо четырёх копий одного и того же кода.
+  function wireCollapsibleCard(headId, bodyId, arrowId) {
+    const head = document.getElementById(headId);
+    const body = document.getElementById(bodyId);
+    const arrow = document.getElementById(arrowId);
+    let collapsed = false;
+    head.addEventListener('click', () => {
+      collapsed = !collapsed;
+      body.classList.toggle('collapsed', collapsed);
+      arrow.textContent = collapsed ? '▸' : '▾';
+    });
+  }
+  wireCollapsibleCard('branchesHeader', 'branchesBody', 'branchesArrow');
+  wireCollapsibleCard('itemsHeader', 'itemsBody', 'itemsArrow');
+  wireCollapsibleCard('cherryPickHeader', 'cherryPickBody', 'cherryPickArrow');
+  wireCollapsibleCard('buildHeader', 'buildBody', 'buildArrow');
+
+  // Номера у карточек (см. .card-num) не зашиты в разметку — блок "Команда для ручного
+  // cherry-pick" показывается не всегда (только пока есть что применять вручную, см.
+  // renderCherryPickCommands), и статичное "1 2 3 4" на месте скрытого блока превратилось бы в
+  // сбивающее с толку "1 2 4". Пересчитывается по фактически видимым .card-num при каждом
+  // изменении видимости блока cherry-pick.
+  function renumberCards() {
+    let n = 0;
+    document.querySelectorAll('.card-num').forEach((el) => {
+      const section = el.closest('section');
+      if (section && section.style.display === 'none') return;
+      n++;
+      el.textContent = String(n);
+    });
+  }
+  renumberCards();
 
   let contextCollapsed = true;
-  document.getElementById('toggleContextBtn').addEventListener('click', () => {
+  document.getElementById('toggleContextBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
     contextCollapsed = !contextCollapsed;
     renderItems();
   });
 
-  document.getElementById('resetCopiedBtn').addEventListener('click', () => {
+  document.getElementById('resetCopiedBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
     copiedCherryCmdKeys.clear();
     renderCherryPickCommands();
   });
@@ -918,20 +1250,48 @@ export class ReleasePanel {
   // runFindStaleBranches в session.ts): (а) ветка отсоединилась от dev раньше самой ранней выбранной
   // в текущей хронологии ветки, (б) ветка просто не отмечена чекбоксом и не трогалась дольше "окна"
   // последних N релизов — в обоих случаях смысл один: "возможно, где-то забытая задача".
+  function addStaleBranchToRelease(ref) {
+    selectedRefs.add(ref);
+    updateSelectedSummary();
+    renderBranches();
+  }
+
+  // Реагирует на ЛЮБОЕ изменение selectedRefs (чекбоксы веток, chip-remove в "Выбрано", сам клик
+  // по "+") — вызывается из updateSelectedSummary, единой точки, куда уже стекаются все такие
+  // изменения. Не только "+" → "✓" при добавлении, но и обратно, если ветку потом убрали из
+  // выбора (например, крестиком в чипе) — кнопка снова становится активной.
+  function updateStaleAddButtons() {
+    [...document.querySelectorAll('.stale-add-btn')].forEach((btn) => {
+      const added = selectedRefs.has(btn.dataset.ref);
+      btn.disabled = added;
+      btn.classList.toggle('added', added);
+      btn.textContent = added ? '✓' : '+';
+    });
+  }
+
   function renderStaleBranches(hints) {
     const el = document.getElementById('staleBranches');
     let body;
     if (!hints || hints.length === 0) {
       body = '<div class="muted">Забытых или давно не выбранных в релиз веток не нашлось.</div>';
     } else {
-      body = '<div class="muted" style="margin:4px 0;">Отсоединились раньше самой ранней ветки в этой хронологии, либо не выбраны в релиз в пределах окна последних релизов, и ещё не выпущены — возможно, забыли:</div>' +
+      body = '<div class="muted" style="margin:4px 0;">Отсоединились раньше самого свежего коммита среди уже выбранных веток в этой хронологии, либо не выбраны в релиз в пределах окна последних релизов, и ещё не выпущены — возможно, забыли:</div>' +
         hints.map((h) => {
           const link = h.commitUrl ? \`<a href="\${h.commitUrl}" target="_blank" rel="noopener">\${h.sha.slice(0,8)}</a>\` : h.sha.slice(0,8);
           const taskLink = h.taskUrl ? \` · <a href="\${h.taskUrl}" target="_blank" rel="noopener">задача</a>\` : '';
-          return \`<div class="stale-branch-row">→ <b>\${escapeHtml(h.branch)}</b> — «\${escapeHtml(h.subject)}», \${link} · \${escapeHtml(h.authorName)} · \${formatDate(h.authorDate)}\${taskLink}</div>\`;
+          // Цвет ветки — тот же colorFor, что и на графе хронологии/в чипах выбора, чтобы забытую
+          // ветку сразу можно было визуально соотнести с остальной панелью. Кнопка "+" добавляет её
+          // в выбор БЕЗ перестроения хронологии — оно, если нужно, отдельным действием (см. кнопку
+          // синхронизации рядом с "Конфликты" — после добавления она станет красной). Начальное
+          // disabled/"✓" — на случай, если ветка уже добавлена в предыдущий раз (см. updateStaleAddButtons).
+          const alreadyAdded = selectedRefs.has(h.ref);
+          return \`<div class="stale-branch-row">→ <span class="chip" style="background:\${colorFor(h.branch)};color:#000;">\${escapeHtml(h.branch)}</span> <button class="stale-add-btn\${alreadyAdded ? ' added' : ''}" data-ref="\${escapeHtml(h.ref)}" title="Добавить в релиз" \${alreadyAdded ? 'disabled' : ''}>\${alreadyAdded ? '✓' : '+'}</button> — «\${escapeHtml(h.subject)}», \${link} · \${escapeHtml(h.authorName)} · \${formatDate(h.authorDate)}\${taskLink}</div>\`;
         }).join('');
     }
     el.innerHTML = renderStaleBranchesControls() + body;
+    [...el.querySelectorAll('.stale-add-btn')].forEach((btn) => {
+      btn.addEventListener('click', () => addStaleBranchToRelease(btn.dataset.ref));
+    });
     bindStaleBranchesLookbackInput();
   }
 
@@ -1019,7 +1379,7 @@ export class ReleasePanel {
 
     let hint = '';
     if (item.alreadyInMain) {
-      hint = \`<div class="conflict-hint">Похоже, эта задача уже выпущена в \${configMainBranch} (см. бейдж «уже в \${configMainBranch}») — возможно, проще просто исключить её из релиза (снять галочку), а не разрешать конфликт.</div>\`;
+      hint = \`<div class="conflict-hint">Похоже, эта задача уже выпущена в \${configMainBranch} — возможно, проще просто исключить её из релиза, а не разрешать конфликт.</div>\`;
     } else {
       const allCauses = sources.flatMap((s) => (s.possibleCauses || []).map((c) => ({ ...c, file: s.file })));
       if (allCauses.length > 0) {
@@ -1062,12 +1422,24 @@ export class ReleasePanel {
       \`<span class="diffstat"><span class="diffstat-add">+\${formatDiffCount(insertions)}</span><span class="diffstat-del">-\${formatDiffCount(deletions)}</span></span>\`,
       \`\${files.size} файлов\`,
     ];
-    if (conflicts > 0) stats.push(\`<span class="badge conflict">\${conflicts} конфликт(ов)</span>\`);
+    if (conflicts > 0) stats.push(\`<span class="badge conflict">⚠ \${conflicts} конфликт(ов)</span>\`);
     return stats.join(sep);
   }
 
+  // Дубликат итога по конфликтам из футера (см. renderChronologySummary выше) прямо в заголовке
+  // карточки "Хронология коммитов" — те же самые числа, просто видно сразу, не скролля вниз.
+  function renderConflictSummaryTop(items) {
+    if (!items || items.length === 0) return '';
+    const conflicts = items.filter((i) => i.included && i.dryRunStatus === 'conflict').length;
+    return conflicts > 0
+      ? \`<span class="conflict-summary-top bad">Конфликты: \${conflicts} ⚠</span>\`
+      : \`<span class="conflict-summary-top ok">Конфликты: 0 ✓</span>\`;
+  }
+
   function updateChronologySummary() {
-    document.getElementById('chronoSummaryRow').innerHTML = renderChronologySummary(currentPlan ? currentPlan.items : []);
+    const items = currentPlan ? currentPlan.items : [];
+    document.getElementById('chronoSummaryRow').innerHTML = renderChronologySummary(items);
+    document.getElementById('conflictSummaryTop').innerHTML = renderConflictSummaryTop(items);
   }
 
   function renderItemRow(item) {
@@ -1077,7 +1449,7 @@ export class ReleasePanel {
     if (item.dryRunStatus === 'ok') dryRunBadge = '<span class="badge ok">конфликтов нет</span>';
     else if (item.dryRunStatus === 'empty') dryRunBadge = '<span class="badge inmain">уже применено (пустой cherry-pick)</span>';
     else if (item.dryRunStatus === 'conflict') {
-      dryRunBadge = \`<span class="badge conflict">конфликт (\${item.dryRunConflictFiles.length} файл(ов))</span>\`;
+      dryRunBadge = \`<span class="badge conflict">⚠ конфликт (\${item.dryRunConflictFiles.length} файл(ов))</span>\`;
       conflictDetails = renderConflictDetails(item);
     }
     const appliedBadge = item.applied ? '<span class="badge applied">применён</span>' : '';
@@ -1648,9 +2020,11 @@ export class ReleasePanel {
     if (items.length === 0) {
       section.style.display = 'none';
       el.innerHTML = '';
+      renumberCards();
       return;
     }
     section.style.display = 'block';
+    renumberCards();
 
     const segments = buildCherryPickSegments(items);
     el.innerHTML = segments
@@ -1744,19 +2118,18 @@ export class ReleasePanel {
       nextColorIndex = 0;
       renderItems();
       updateBuildButtonsState();
+      updateSyncIndicator();
     } else if (msg.command === 'currentBranch') {
-      document.getElementById('currentBranchName').textContent = msg.current;
-      document.getElementById('mainBranchName').textContent = msg.mainBranch;
+      currentBranchValue = msg.current;
+      renderCurrentBranchSelect();
       configMainBranch = msg.mainBranch;
       configDevBranch = msg.devBranch;
       staleBranchesLookbackReleases = msg.staleBranchesLookbackReleases;
       document.getElementById('hideInMainFilterBranchName').textContent = configMainBranch;
-      document.getElementById('branchListLimitBtn').title = \`Применяет флажок «Скрыть в \${configMainBranch}» и лимит показа вместе\`;
       setPullBusy(false);
       // Блок "Забытые ветки" ещё не показан на этот момент (хронология не построена) — просто
       // запоминаем значение для инпута, который появится вместе с самим блоком (см. renderStaleBranches*).
     } else if (msg.command === 'branches') {
-      setBranchListLimitBusy(false);
       setRefreshBusy(false);
       // Первый ответ 'branches' — надёжный признак, что this.fullBranches на сервере уже
       // загружен: перепроверяем дату релиза именно теперь, а не только сразу при загрузке
@@ -1773,18 +2146,27 @@ export class ReleasePanel {
         selectionInitialized = true;
       }
       renderBranches();
-      renderBranchNamesList();
+      renderCurrentBranchSelect();
       updateSelectedSummary();
       const info = msg.info;
       if (!limitInitialized) {
-        document.getElementById('branchListLimitInput').value = String(info.limit);
+        const limitSelect = document.getElementById('branchListLimitInput');
+        limitSelect.value = String(info.limit);
+        // Сохранённый лимит может не совпасть ни с одним пресетом (например, задан ещё до перехода
+        // на select с фиксированными вариантами) — тогда .value молча становится пустым, и селект
+        // выглядит "сломанным" (ничего не выбрано). Добавляем недостающий вариант, а не округляем
+        // до ближайшего пресета — иначе следующий же реактивный change тихо подрезал бы лимит,
+        // который пользователь когда-то намеренно указал.
+        if (limitSelect.value !== String(info.limit)) {
+          limitSelect.insertAdjacentHTML('beforeend', \`<option value="\${info.limit}" selected>\${info.limit}</option>\`);
+        }
         limitInitialized = true;
       }
       const infoEl = document.getElementById('branchListInfo');
       if (info.totalBranches === 0) {
         infoEl.textContent = 'В репозитории не найдено веток.';
       } else if (info.truncated) {
-        infoEl.textContent = \`Показано \${msg.branches.length} из \${info.totalMatches} совпадений (всего веток в репозитории: \${info.totalBranches}). Уточните фильтр или увеличьте лимит в настройках.\`;
+        infoEl.textContent = \`Показано \${msg.branches.length} из \${info.totalMatches} совпадений (всего веток в репозитории: \${info.totalBranches}).\`;
       } else {
         infoEl.textContent = \`Показано \${msg.branches.length} из \${info.totalBranches} веток.\`;
       }
@@ -1823,14 +2205,19 @@ export class ReleasePanel {
       copiedCherryCmdKeys.clear();
       renderItems();
       updateBuildButtonsState();
+      updateSyncIndicator();
     } else if (msg.command === 'releaseBranchPatternCount') {
       releaseBranchPatternCount = msg.count;
       // Число входит прямо в текст окна поиска забытых веток (см. renderStaleBranchesControls) —
-      // перерисовываем тот же блок, что уже показан (результаты, если поиск успел завершиться,
-      // иначе всё ещё "загрузка"), чтобы новое число не осталось висеть только при следующей
-      // перерисовке от другого события.
-      if (lastStaleHints !== null) renderStaleBranches(lastStaleHints);
-      else renderStaleBranchesLoading();
+      // перерисовываем тот же блок, что уже показан. Это сообщение шлётся при КАЖДОМ обновлении
+      // списка веток (см. session.ts refreshBranches), в т.ч. сразу при открытии панели, задолго
+      // до первой постройки хронологии — currentPlan тут проверяем специально: без него
+      // renderStaleBranchesLoading() показывал бы "Проверяем..." для скана, который на самом деле
+      // ещё даже не запускался (сам скан стартует только внутри rebuildPlan, см. session.ts).
+      if (currentPlan) {
+        if (lastStaleHints !== null) renderStaleBranches(lastStaleHints);
+        else renderStaleBranchesLoading();
+      }
     } else if (msg.command === 'releaseDateCheck') {
       // Не трогаем текст статуса, если уже есть готовый план (см. updateBuildButtonsState — там
       // же он сам покажет "Релизная ветка: X"/прогресс сборки) — иначе просмотр другой даты в поле
@@ -1859,6 +2246,10 @@ export class ReleasePanel {
       renderStaleBranchesLoading();
     } else if (msg.command === 'staleBranches') {
       lastStaleHints = msg.hints;
+      // Забытая ветка обычно не входит в текущий (отфильтрованный/урезанный лимитом) срез
+      // currentBranches — без этого её ref не попал бы в branchNameByRef, и после "Добавить в
+      // релиз" чип в "Выбрано" показывал бы голый ref вместо чистого имени ветки.
+      for (const h of msg.hints) branchNameByRef.set(h.ref, h.branch);
       renderStaleBranches(msg.hints);
     } else if (msg.command === 'progress') {
       if (!currentPlan) return;
@@ -1883,7 +2274,6 @@ export class ReleasePanel {
         '<span style="color:var(--vscode-charts-green);">✓ Релизная ветка опубликована (запушена в remote).</span>';
     } else if (msg.command === 'error') {
       setBuildPlanBusy(false);
-      setBranchListLimitBusy(false);
       setRefreshBusy(false);
       setPullBusy(false);
       showError(msg.message);

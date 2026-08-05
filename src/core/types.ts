@@ -129,6 +129,8 @@ export interface ConflictCause {
   authorDate: string;
   /** Короткое имя ветки-кандидата (без remote-префикса) */
   branch: string;
+  /** Ref в формате refname:short (например, origin/feature/PROJ-1234) — то же значение, что и BranchRef.ref, чтобы можно было напрямую отметить эту ветку выбранной (см. StaleBranchHint/"Добавить в релиз" в releasePanel.ts), не разыскивая её заново по имени. */
+  ref: string;
   /** Ссылка на задачу в таск-трекере, вычисленная из ключа в имени ветки/subject коммита; null, если ключ не найден или трекер не настроен */
   taskUrl: string | null;
   commitUrl: string | null;
@@ -234,6 +236,8 @@ export interface MergeEventInfo {
  */
 export interface StaleBranchHint {
   branch: string;
+  /** См. ConflictCause.ref — тот же формат refname:short, что и BranchRef.ref. */
+  ref: string;
   sha: string;
   subject: string;
   authorDate: string;

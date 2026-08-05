@@ -74,11 +74,13 @@ export class ReleaseSession implements ReleasePanelHost {
    */
   private hideAlreadyInMain = false;
   /**
-   * "Скрыть служебные ветки" (qa, revert-pr-, chore/ и т.п. — см. nonTaskBranchPrefixes) —
+   * "Показать служебные ветки" (qa, revert-pr-, chore/ и т.п. — см. nonTaskBranchPrefixes) —
    * в отличие от hideAlreadyInMain, это просто проверка префикса имени, без единого git-вызова,
-   * поэтому применяется СРАЗУ при переключении чекбокса, а не по кнопке "Применить".
+   * поэтому применяется СРАЗУ при переключении переключателя, реактивно. По умолчанию служебные
+   * ветки СКРЫТЫ (true) — обычно они не нужны при выборе веток в релиз, показывать их сразу же
+   * при первом открытии панели скорее шум, чем полезная информация.
    */
-  private hideServiceBranches = false;
+  private hideServiceBranches = true;
   /** Растёт при каждом новом срезе списка веток — защищает от того, что устаревшее (фоновое) уточнение статуса "в main" перезапишет уже новый список. */
   private branchSliceGeneration = 0;
   /**
@@ -902,9 +904,21 @@ export class ReleaseSession implements ReleasePanelHost {
     await this.sendBranchSlice(query);
   }
 
-  async onPullBranch(branchName: string): Promise<void> {
+  /**
+   * Переключение на другую ветку (только checkout, без pull) — панель делает это САМА при выборе
+   * ветки в селекте "Текущая ветка" (см. releasePanel.ts), pull — отдельным действием по кнопке
+   * "Pull" (см. onPullCurrentBranch), уже над тем, что выбрано здесь.
+   */
+  async onSwitchBranch(branchName: string): Promise<void> {
     await this.git.assertClean();
     await this.git.checkoutBranch(branchName);
+    await this.postCurrentBranch();
+    await this.refreshBranches();
+  }
+
+  /** Pull ТЕКУЩЕЙ (уже выбранной через onSwitchBranch) ветки — без параметра имени и без checkout. */
+  async onPullCurrentBranch(): Promise<void> {
+    await this.git.assertClean();
     await this.git.pull();
     await this.postCurrentBranch();
     await this.refreshBranches();
@@ -980,10 +994,10 @@ export class ReleaseSession implements ReleasePanelHost {
    * широкий скан по ВСЕМУ репозиторию (дороже узкого findConflictCauses), поэтому запускается
    * отдельно от остального построения плана и результат подгружается следом (панель тем временем
    * показывает индикатор загрузки — см. postStaleBranchesLoading). Ищет ветки, ещё не выпущенные в
-   * main и либо отсоединившиеся РАНЬШЕ самой ранней ветки в текущей хронологии, либо просто не
-   * отмеченные чекбоксом сейчас и не трогавшиеся дольше окна последних staleBranchesLookbackReleases
-   * релизов (более ПОЗДНЯЯ из двух дат в качестве верхней границы `--until` — так шире, чем любой
-   * сигнал по отдельности, а не уже). Ошибки тут
+   * main и либо отсоединившиеся РАНЬШЕ самого свежего коммита среди уже выбранных веток в текущей
+   * хронологии, либо просто не отмеченные чекбоксом сейчас и не трогавшиеся дольше окна последних
+   * staleBranchesLookbackReleases релизов (более ПОЗДНЯЯ из двух дат в качестве верхней границы
+   * `--until` — так шире, чем любой сигнал по отдельности, а не уже). Ошибки тут
    * намеренно не всплывают наверх и не портят уже показанную хронологию — это необязательная
    * подсказка, а не критичная часть построения плана. `generation` защищает от гонки: если, пока
    * шёл скан, выбор веток уже поменялся и построился новый план, устаревший результат просто не
@@ -991,14 +1005,23 @@ export class ReleaseSession implements ReleasePanelHost {
    */
   private async runFindStaleBranches(generation: number, mainRef: string): Promise<void> {
     if (!this.plan) return;
-    const earliestSelectedDate = this.plan.items.reduce((min, i) => (i.authorDate < min ? i.authorDate : min), this.plan.items[0].authorDate);
+    // САМЫЙ СВЕЖИЙ коммит среди выбранных (MAX), а не самый ранний (MIN) — раньше здесь была
+    // именно MIN-дата, из-за чего добавление в выбор ЕЩЁ ОДНОЙ, более старой ветки сдвигало эту
+    // границу НАЗАД во времени и "прятало" уже найденную забытую ветку, оказавшуюся между старой и
+    // новой границей (подтверждено на реальном кейсе: с одной выбранной feature/DOS-2808 забытая
+    // feature/DOS-2841 находилась верно, но стоило добавить в выбор ещё и более старую feature/
+    // DOS-2863 — feature/DOS-2841 переставала считаться забытой, хотя объективно осталась точно
+    // такой же неучтённой веткой). MAX не зависит от того, какие ещё старые ветки попали в выбор:
+    // граница — это "самое свежее из уже происходящего в этом релизе", и она может только
+    // сдвигаться ВПЕРЁД (если выбрали ветку свежее), а не назад.
+    const latestSelectedDate = this.plan.items.reduce((max, i) => (i.authorDate > max ? i.authorDate : max), this.plan.items[0].authorDate);
     const releaseLookbackDate = this.findReleaseLookbackDate(this.config.staleBranchesLookbackReleases);
     // MAX, а не MIN: --until в logCommitsNotInRefBeforeDate — верхняя граница (коммиты ДО этой
-    // даты), поэтому объединение "по ИЛИ" двух сигналов (раньше earliestSelectedDate ИЛИ раньше
-    // releaseLookbackDate) даёт именно более позднюю из двух дат — раньше здесь по ошибке стояла
-    // более РАННЯЯ (MIN), которая только сужала окно относительно исходного earliestSelectedDate
-    // и могла вовсе потерять сигнал (б), а не расширить поиск, как задумано.
-    const beforeDate = releaseLookbackDate && releaseLookbackDate > earliestSelectedDate ? releaseLookbackDate : earliestSelectedDate;
+    // даты), поэтому объединение "по ИЛИ" двух сигналов (раньше latestSelectedDate ИЛИ раньше
+    // releaseLookbackDate) даёт именно более позднюю из двух дат — более РАННЯЯ (MIN) только
+    // сужала бы окно относительно исходного latestSelectedDate и могла вовсе потерять сигнал (б),
+    // а не расширить поиск, как задумано.
+    const beforeDate = releaseLookbackDate && releaseLookbackDate > latestSelectedDate ? releaseLookbackDate : latestSelectedDate;
     const excludeShas = new Set(this.plan.items.map((i) => i.sha));
     let hints: Awaited<ReturnType<typeof findStaleUnmergedBranches>> = [];
     try {

@@ -402,6 +402,16 @@ export async function computeMainStatusForBranches(
   devFirstParentShas: DevFirstParentShas,
   extraBaseRefs: ExtraBaseRef[] = []
 ): Promise<{ statusByRef: Map<string, MainStatus>; diffStatByRef: Map<string, BranchDiffStat> }> {
+  // Нулевой diffstat — как и любой другой, а не "нет ответа": ветка без единого собственного
+  // коммита (уже целиком поглощена dev'ом — типичный случай для самой dev-ветки в списке, либо
+  // для feature-ветки, которую уже смёржили) объективно ничего не меняет относительно dev, это
+  // ЗНАЕМЫЙ факт, а не "ещё считаем". Раньше для такой ветки diffStatByRef.set(...) вообще не
+  // вызывался (см. цикл ниже, filter на commits.length===0) — на клиенте .has(ref) оставался
+  // false НАВСЕГДА, и спиннер "загрузка изменений" в строке списка крутился бесконечно (найдено
+  // на dev и на уже влитой feature/DOS-2615 в реальном репозитории). Любой другой сбой на этом
+  // пути (ошибка git-вызова) — тоже терминальное состояние, а не "попробуем ещё раз": лучше
+  // показать 0, чем вечную загрузку ради второстепенной сводки.
+  const ZERO_DIFF_STAT: BranchDiffStat = { insertions: 0, deletions: 0, filesChanged: 0 };
   const perBranch = await mapWithConcurrency(branches, BACKGROUND_CONCURRENCY, async (branch) => {
     try {
       const { commits } = await resolveBranchOwnCommits(
@@ -413,7 +423,7 @@ export async function computeMainStatusForBranches(
         MAX_COMMITS_PER_BRANCH,
         extraBaseRefs
       );
-      let diffStat: BranchDiffStat | null = null;
+      let diffStat: BranchDiffStat = ZERO_DIFF_STAT;
       if (commits.length > 0) {
         try {
           const base = commits[0].parents[0] ?? EMPTY_TREE_SHA;
@@ -421,12 +431,12 @@ export async function computeMainStatusForBranches(
           const stat = await git.diffStat(tip, base);
           diffStat = { insertions: stat.insertions, deletions: stat.deletions, filesChanged: stat.files.length };
         } catch {
-          // Второстепенная сводка — молча остаёмся без неё для этой ветки, основной статус "в main" не трогаем.
+          // Второстепенная сводка — молча остаёмся с нулём для этой ветки, основной статус "в main" не трогаем.
         }
       }
       return { ref: branch.ref, commits, diffStat };
     } catch {
-      return { ref: branch.ref, commits: [] as FirstParentCommit[], diffStat: null as BranchDiffStat | null };
+      return { ref: branch.ref, commits: [] as FirstParentCommit[], diffStat: ZERO_DIFF_STAT };
     }
   });
 
@@ -625,6 +635,19 @@ function refToBranchName(ref: string, remoteName: string): string {
   return ref;
 }
 
+/**
+ * То же самое, что refToBranchName, но БЕЗ снятия remote-префикса — даёт тот же формат
+ * refname:short, что и BranchRef.ref (например, origin/feature/PROJ-1234 для remote-ветки,
+ * feature/PROJ-1234 для локальной), чтобы ConflictCause.ref/StaleBranchHint.ref можно было
+ * напрямую положить в selectedRefs на клиенте (см. "Добавить в релиз" в releasePanel.ts), а не
+ * заново разыскивать подходящую ветку по одному только имени.
+ */
+function sourceRefToShortRef(ref: string): string {
+  if (ref.startsWith('refs/heads/')) return ref.slice('refs/heads/'.length);
+  if (ref.startsWith('refs/remotes/')) return ref.slice('refs/remotes/'.length);
+  return ref;
+}
+
 interface RawCandidate {
   sha: string;
   subject: string;
@@ -652,7 +675,7 @@ async function filterGenuineCandidates(
 ): Promise<ConflictCause[]> {
   const candidates = raw
     .filter((c) => !excludeShas.has(c.sha))
-    .map((c) => ({ ...c, branch: refToBranchName(c.sourceRef, remoteName) }))
+    .map((c) => ({ ...c, branch: refToBranchName(c.sourceRef, remoteName), ref: sourceRefToShortRef(c.sourceRef) }))
     .filter((c) => !isIgnorableCandidate(c.branch));
   if (candidates.length === 0) {
     return [];
@@ -669,7 +692,7 @@ async function filterGenuineCandidates(
   for (const c of genuine) {
     const existing = byBranch.get(c.branch);
     if (!existing || c.authorDate > existing.authorDate) {
-      byBranch.set(c.branch, { sha: c.sha, subject: c.subject, authorName: c.authorName, authorDate: c.authorDate, branch: c.branch, taskUrl: null, commitUrl: null });
+      byBranch.set(c.branch, { sha: c.sha, subject: c.subject, authorName: c.authorName, authorDate: c.authorDate, branch: c.branch, ref: c.ref, taskUrl: null, commitUrl: null });
     }
   }
   return [...byBranch.values()].sort((a, b) => (a.authorDate < b.authorDate ? 1 : -1)).slice(0, limit);
@@ -717,5 +740,5 @@ export async function findStaleUnmergedBranches(
 ): Promise<StaleBranchHint[]> {
   const raw = await git.logCommitsNotInRefBeforeDate(mainRef, beforeDateIso, MAX_STALE_CANDIDATES);
   const causes = await filterGenuineCandidates(git, mainRef, raw, excludeShas, isIgnorableCandidate, remoteName, 10);
-  return causes.map(({ branch, sha, subject, authorName, authorDate, taskUrl, commitUrl }) => ({ branch, sha, subject, authorName, authorDate, taskUrl, commitUrl }));
+  return causes.map(({ branch, ref, sha, subject, authorName, authorDate, taskUrl, commitUrl }) => ({ branch, ref, sha, subject, authorName, authorDate, taskUrl, commitUrl }));
 }

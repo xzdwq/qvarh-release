@@ -1,19 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 10" width="24" height="24" shape-rendering="crispEdges">
-  <!-- Пиксельная морда лягушки: два глаза-бугорка сверху, широкая голова, пасть снизу. -->
-  <rect x="2" y="0" width="2" height="1" fill="currentColor"/>
-  <rect x="8" y="0" width="2" height="1" fill="currentColor"/>
-  <!-- Зрачки: разрыв (прозрачная ячейка) внутри бугорка глаза — единственный способ показать деталь в одноцветной иконке. -->
-  <rect x="1" y="1" width="2" height="1" fill="currentColor"/>
-  <rect x="4" y="1" width="1" height="1" fill="currentColor"/>
-  <rect x="7" y="1" width="1" height="1" fill="currentColor"/>
-  <rect x="9" y="1" width="2" height="1" fill="currentColor"/>
-  <rect x="1" y="2" width="10" height="1" fill="currentColor"/>
-  <rect x="0" y="3" width="12" height="4" fill="currentColor"/>
-  <rect x="0" y="7" width="3" height="1" fill="currentColor"/>
-  <rect x="5" y="7" width="2" height="1" fill="currentColor"/>
-  <rect x="9" y="7" width="3" height="1" fill="currentColor"/>
-  <rect x="1" y="8" width="2" height="1" fill="currentColor"/>
-  <rect x="9" y="8" width="2" height="1" fill="currentColor"/>
-  <rect x="2" y="9" width="2" height="1" fill="currentColor"/>
-  <rect x="8" y="9" width="2" height="1" fill="currentColor"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Классическая иконка git-ветки: ствол сверху вниз + одно ответвление вправо, три узла-коммита. -->
+  <path d="M4 3 L4 13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/>
+  <path d="M4 6.2 C7 6.2 7 8 11 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/>
+  <circle cx="4" cy="3" r="1.6" fill="currentColor"/>
+  <circle cx="4" cy="13" r="1.6" fill="currentColor"/>
+  <circle cx="12" cy="8" r="1.6" fill="currentColor"/>
 </svg>

@@ -2,11 +2,19 @@ import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 import { parseNonTaskBranchPrefixes, readProjects, saveProjects } from '../config';
 import { ProjectProfile } from '../core/types';
+import { getActiveProjectId, onActiveProjectChanged } from '../activeProject';
 
 export class SettingsViewProvider implements vscode.WebviewViewProvider {
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     webviewView.webview.options = { enableScripts: true };
     webviewView.webview.html = this.renderHtml();
+
+    // Живое выделение "какой проект сейчас открыт в панели сборки" (см. project-row.active в
+    // клиентском скрипте) — переоткрытие панели для ДРУГОГО проекта, пока список проектов открыт
+    // в этой же боковой панели, должно тут же перерисовать подсветку, а не только при следующем
+    // 'ready'/сохранении/удалении.
+    const activeProjectSub = onActiveProjectChanged(() => this.postProjects(webviewView.webview));
+    webviewView.onDidDispose(() => activeProjectSub.dispose());
 
     webviewView.webview.onDidReceiveMessage(async (message) => {
       try {
@@ -37,7 +45,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   private postProjects(webview: vscode.Webview): void {
     const projects = readProjects().map((p) => ({ ...p, nonTaskBranchPrefixes: p.nonTaskBranchPrefixes.join(', ') }));
-    webview.postMessage({ command: 'projects', projects });
+    webview.postMessage({ command: 'projects', projects, activeProjectId: getActiveProjectId() });
   }
 
   /** id === null — новый профиль (генерируем стабильный id); иначе обновляем существующий по id. */
@@ -138,11 +146,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     background: var(--vscode-list-hoverBackground, transparent);
   }
   .project-row-info { flex: 1; min-width: 0; }
-  .project-row-name { font-weight: 600; }
-  .project-row-path { opacity: 0.65; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .project-row-name { font-weight: 600; display: flex; align-items: center; gap: 5px; }
+  .project-row-path { opacity: 0.65; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; align-items: center; gap: 5px; }
+  .project-row-name svg, .project-row-path svg, .start-icon svg { flex: none; width: 13px; height: 13px; opacity: 0.8; }
   .project-row button { margin: 0; padding: 4px 8px; font-size: 12px; line-height: 1; border-radius: 4px; }
+  .project-row button.start-icon { display: inline-flex; align-items: center; justify-content: center; }
   .project-row.confirm-row { background: transparent; border-color: var(--vscode-inputValidation-errorBorder); }
   .project-row.confirm-row .project-row-info { font-size: 11px; line-height: 1.4; color: var(--vscode-errorForeground); }
+  /* Проект, сейчас открытый в панели сборки релиза (см. activeProject.ts) — акцентная рамка +
+     маленький бейдж "открыт", а не просто другой фон, чтобы не потерять читаемость имени поверх
+     background: var(--vscode-list-hoverBackground) у обычной строки. */
+  .project-row.active { border-color: var(--vscode-focusBorder); border-width: 2px; padding: 6px 7px; }
+  .active-badge { font-size: 10px; font-weight: 400; opacity: 0.75; padding: 1px 6px; border-radius: 8px; background: var(--vscode-focusBorder); color: var(--vscode-editor-background); }
 
   .project-form {
     margin-top: 10px; padding: 10px; border-radius: 6px;
@@ -213,10 +228,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   const vscode = acquireVsCodeApi();
   const PROJECT_FIELDS = ['name','repositoryPath','mainBranch','devBranch','remoteName','releaseBranchPattern','branchListLimit','nonTaskBranchPrefixes','staleBranchesLookbackReleases','taskTrackerBaseUrl','bitbucketWorkspace','bitbucketRepoSlug'];
   const PROJECT_CHECKBOX_FIELDS = ['hideDuplicateRemoteBranches'];
+  // Обычные строковые литералы в одинарных кавычках, а не шаблонные — внутри одного большого
+  // TS-темплейта в renderHtml() (см. HANDOFF.md) обратный слэш/обратная кавычка тут потребовали бы
+  // двойного экранирования, а тут интерполяция всё равно не нужна, литерал проще и надёжнее.
+  const PROJECT_ICON = '<svg viewBox="0 0 14 14" width="14" height="14"><path d="M2 4.5L7 2l5 2.5v5L7 12 2 9.5v-5z" stroke="currentColor" stroke-width="1.1" fill="none" stroke-linejoin="round"/><path d="M2 4.5L7 7l5-2.5M7 7v5" stroke="currentColor" stroke-width="1.1" fill="none" stroke-linejoin="round"/></svg>';
+  const FOLDER_ICON = '<svg viewBox="0 0 14 14" width="14" height="14"><path d="M1.5 3.5h4l1 1.2h6v6.3h-11z" stroke="currentColor" stroke-width="1.1" fill="none" stroke-linejoin="round"/></svg>';
+  const GIT_ICON = '<svg viewBox="0 0 16 16" width="14" height="14"><path d="M4 3 L4 13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/><path d="M4 6.2 C7 6.2 7 8 11 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/><circle cx="4" cy="3" r="1.6" fill="currentColor"/><circle cx="4" cy="13" r="1.6" fill="currentColor"/><circle cx="12" cy="8" r="1.6" fill="currentColor"/></svg>';
 
   let projects = [];
   let editingProjectId = null;
   let pendingDeleteId = null;
+  let activeProjectId = null;
 
   function escapeHtml(s) {
     return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
@@ -247,15 +269,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         \`;
       }
       const startTitle = formOpen ? 'Сначала закройте форму редактирования проекта' : 'Собрать релизную ветку для этого проекта';
+      // Подсветка "сейчас открыт в панели сборки релиза" (см. activeProject.ts) — сравнение по id
+      // сохранённого профиля, не по имени/пути (одноимённых профилей быть не должно, но id надёжнее).
+      const isActive = p.id === activeProjectId;
       return \`
-      <div class="project-row">
+      <div class="project-row\${isActive ? ' active' : ''}">
         <div class="project-row-info">
-          <div class="project-row-name">\${escapeHtml(p.name)}</div>
-          <div class="project-row-path">\${escapeHtml(p.repositoryPath)}</div>
+          <div class="project-row-name">\${PROJECT_ICON}\${escapeHtml(p.name)}\${isActive ? '<span class="active-badge">открыт</span>' : ''}</div>
+          <div class="project-row-path">\${FOLDER_ICON}\${escapeHtml(p.repositoryPath)}</div>
         </div>
-        <button data-action="start" data-id="\${p.id}" title="\${startTitle}" \${formOpen ? 'disabled' : ''}>🚀</button>
+        <button class="start-icon" data-action="start" data-id="\${p.id}" title="\${startTitle}" \${formOpen ? 'disabled' : ''}>\${GIT_ICON}</button>
         <button class="secondary" data-action="edit" data-id="\${p.id}" title="Изменить">✎</button>
-        <button class="secondary" data-action="delete" data-id="\${p.id}" title="Удалить">✕</button>
+        <button class="danger" data-action="delete" data-id="\${p.id}" title="Удалить">✕</button>
       </div>
     \`;
     }).join('');
@@ -342,6 +367,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const msg = event.data;
     if (msg.command === 'projects') {
       projects = msg.projects;
+      activeProjectId = msg.activeProjectId ?? null;
       renderProjectsList();
     } else if (msg.command === 'saved') {
       const flash = document.getElementById('savedFlash');
