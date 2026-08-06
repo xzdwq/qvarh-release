@@ -437,6 +437,11 @@ export class ReleasePanel {
      (0 0 0 4px) без явных width/height, из-за чего рамка наведения браузера обрамляла
      несимметричный бокс, а "×" внутри неё съезжал вправо, а не в центр. */
   .chip-remove { background: none; border: none; color: inherit; cursor: pointer; padding: 0; margin: 0 0 0 4px; font-size: 12px; width: 14px; height: 14px; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; }
+  /* Очистить весь выбор одним кликом (см. clearSelectedBranches) — красный кружок с "×", как
+     .chip-remove у отдельного чипа, только заметнее и всегда первым в строке "Выбрано", раз он
+     сбрасывает ВСЁ, а не один чип. */
+  .clear-all-btn { background: var(--vscode-charts-red); color: #fff; border: none; padding: 0; margin: 0 6px 0 0; font-size: 12px; font-weight: 700; width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; cursor: pointer; vertical-align: middle; }
+  .clear-all-btn:hover { filter: brightness(1.15); }
   .card-head .collapse-arrow { font-size: 10px; opacity: 0.7; width: 10px; display: inline-block; text-align: center; }
   .collapsible-body.collapsed { display: none; }
   /* "Rail" — дорожки веток слева от хронологии (см. renderItems/computeRail/drawRail): dev-"ствол"
@@ -600,16 +605,17 @@ export class ReleasePanel {
         </select>
       </label>
     </div>
-    <div id="branchListInfo" class="muted" style="margin-top:6px;">Загрузка списка веток…</div>
     <label style="display:inline-block; margin:6px 0;" title="Выбирает/снимает выбор со всех веток, показанных ниже — то есть с учётом текущего фильтра, а не вообще всех веток репозитория">
       <input type="checkbox" id="selectAllVisibleBranches" /> Выбрать все
     </label>
+    <button id="toggleAllCommitsBtn" class="secondary small-btn" style="margin:6px 0 6px 8px;" data-mode="expand">▸ Показать коммиты в dev (для всех)</button>
     <div id="branchListHeaderRow" class="branch-grid-row branch-header-row" style="display:none;">
       <div class="branch-rail-spacer"></div>
       <div class="chrono-cell chrono-header-cell">Ветка и последний коммит</div>
       <div class="chrono-cell chrono-header-cell" style="text-align:right;">Изменения</div>
     </div>
     <div id="branchList"><div class="muted branch-list-loading">Загрузка веток…</div></div>
+    <div id="branchListInfo" class="muted" style="margin-top:6px;">Загрузка списка веток…</div>
     <div id="selectedSummary" class="muted" style="margin-top:6px;"></div>
 
     <div class="button-row">
@@ -849,17 +855,27 @@ export class ReleasePanel {
     renderBranches();
   }
 
+  function clearSelectedBranches() {
+    selectedRefs.clear();
+    updateSelectedSummary();
+    renderBranches();
+  }
+
   function updateSelectedSummary() {
     const el = document.getElementById('selectedSummary');
     if (selectedRefs.size === 0) {
       el.textContent = 'Ветки не выбраны';
     } else {
-      el.innerHTML = 'Выбрано: ' + [...selectedRefs].map((ref) => {
+      const chips = [...selectedRefs].map((ref) => {
         const name = branchNameByRef.get(ref) || ref;
         // Цвет чипа — тот же colorFor(name), что и у дорожки ветки на графе, чтобы выбор в списке и
         // сама хронология были визуально связаны (см. .cherry-sha — тот же приём для sha в командах).
         return \`<span class="chip" style="background:\${colorFor(name)};color:#000;">\${name} <button class="chip-remove" data-ref="\${ref}" title="Убрать из выбора">×</button></span>\`;
       }).join('');
+      // Крестик очистки всего выбора — только когда есть что чистить (при 0 выбранных сам текст
+      // уже другой, см. ветку выше, кнопке рядом с "Ветки не выбраны" просто нечего делать).
+      el.innerHTML = \`<button id="clearSelectedBtn" class="clear-all-btn" title="Очистить выбранное">×</button> Выбрано (\${selectedRefs.size}): \${chips}\`;
+      document.getElementById('clearSelectedBtn').addEventListener('click', clearSelectedBranches);
 
       [...el.querySelectorAll('.chip-remove')].forEach((btn) => {
         btn.addEventListener('click', (e) => deselectBranch(e.target.dataset.ref));
@@ -1008,6 +1024,7 @@ export class ReleasePanel {
     // репозитория — отмечен, только если ВСЕ показанные сейчас строки выбраны.
     document.getElementById('selectAllVisibleBranches').checked =
       currentBranches.length > 0 && currentBranches.every((b) => selectedRefs.has(b.ref));
+    updateToggleAllCommitsBtn();
 
     // Тот же приём, что и в drawRailNow хронологии (см. ниже, renderItems): координаты по
     // офсетам реально отрендеренных строк, а не подгонка под фиксированную высоту — перенос текста
@@ -1052,6 +1069,35 @@ export class ReleasePanel {
       else selectedRefs.delete(b.ref);
     }
     updateSelectedSummary();
+    renderBranches();
+  });
+
+  // Текст/режим пересчитывается КАЖДЫЙ рендер по факту (все ли ПОКАЗАННЫЕ ветки сейчас развёрнуты)
+  // — тот же приём, что и у "Выбрать все" чуть выше, а не отдельный независимый флаг: иначе кнопка
+  // могла бы разойтись с реальным состоянием, если пользователь сам развернул/свернул одну ветку
+  // вручную (см. .expand-toggle).
+  function updateToggleAllCommitsBtn() {
+    const btn = document.getElementById('toggleAllCommitsBtn');
+    const allExpanded = currentBranches.length > 0 && currentBranches.every((b) => expandedRefs.has(b.ref));
+    btn.dataset.mode = allExpanded ? 'collapse' : 'expand';
+    btn.textContent = allExpanded
+      ? \`▾ Скрыть коммиты в \${configDevBranch} (для всех)\`
+      : \`▸ Показать коммиты в \${configDevBranch} (для всех)\`;
+  }
+  document.getElementById('toggleAllCommitsBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    const expand = e.target.dataset.mode !== 'collapse';
+    for (const b of currentBranches) {
+      if (expand) {
+        expandedRefs.add(b.ref);
+        if (!branchCommitsCache.has(b.ref)) {
+          branchCommitsCache.set(b.ref, 'loading');
+          vscode.postMessage({ command: 'expandBranch', ref: b.ref });
+        }
+      } else {
+        expandedRefs.delete(b.ref);
+      }
+    }
     renderBranches();
   });
 
