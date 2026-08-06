@@ -1516,18 +1516,16 @@ export class ReleasePanel {
   // зарезервирован под "ствол" dev (открыт на всю показанную историю — контекстные/якорный
   // коммиты и есть его настоящие коммиты). Каждая выбранная ветка получает свой лейн по порядку
   // первого появления среди items; лейн "открыт" от строки её первого коммита до строки, где
-  // найден коммит слияния ЭТОЙ ветки обратно в dev (см. MERGE_SUBJECT_RE — тот же формат subject,
-  // что и GitService.listMergeEvents), либо до конца показанного окна, если слияние не нашлось —
-  // это и есть сигнал "ветка всё ещё не влита" прямо на графе, без отдельного текста.
-  // ВАЖНО: этот кусок — часть ОДНОГО большого TS-темплейта в renderHtml() (весь HTML/JS панели —
-  // одна строка-темплейт), поэтому обратные слэши здесь нужно ЭКРАНИРОВАТЬ ДВОЙНЫМ слэшем — иначе
-  // компилятор съедает одиночный "\" ещё на этапе сборки САМОГО расширения (до того, как этот текст
-  // вообще попадёт в браузер), и на выходе в собранном dist/extension.js регулярка превращается в
-  // /^Merged in (S+) (pull request #(d+))/ — без единого реального \S/\(/\d/\) — поэтому НИЧЕГО не
-  // матчилось, хотя сам исходный текст (и любой юнит-тест, читающий .ts-файл текстом, а не через
-  // компилятор) выглядел абсолютно корректным. Отсюда и не находился mergedAtRow ни для одной ветки.
-  const MERGE_SUBJECT_RE = /^Merged in (\\S+) \\(pull request #(\\d+)\\)/;
-
+  // найден коммит слияния ЭТОЙ ветки обратно в dev, либо до конца показанного окна, если слияние
+  // не нашлось — это и есть сигнал "ветка всё ещё не влита" прямо на графе, без отдельного текста.
+  //
+  // Раньше здесь ветка каждой строки-маркера слияния (mergeMarker) заново разбиралась из subject
+  // регуляркой (тот же формат, что GitService.listMergeEvents искал по всей истории dev) — то
+  // есть привязка к тексту БЫЛА ДВАЖДЫ: один раз на сервере (там уже топология, не текст, см.
+  // listMergeEvents), и снова здесь, притом что сервер и так ЗНАЕТ, к какой ветке относится
+  // событие (это ключ mergeEventsByBranch) — просто эта информация терялась при
+  // Object.values(...).flat() в renderItems и восстанавливалась заново текстом. Теперь branch
+  // приходит прямо в самой строке-маркере (см. renderItems), разбирать subject не нужно вообще.
   function computeRail(merged) {
     // Порядок первого появления веток среди 'item'-строк — нужен только чтобы знать, какие ветки
     // вообще есть, и как стабильный запасной порядок; конкретный НОМЕР лейна назначается позже,
@@ -1542,23 +1540,17 @@ export class ReleasePanel {
     });
 
     // ТОЛЬКО kind='mergeMarker' — построенные на клиенте из авторитетного ReleasePlan.mergeEventsByBranch
-    // (см. renderItems), а не любая строка, чей subject случайно похож на "Merged in X (PR #N)".
-    // Если имя ветки когда-то уже использовалось раньше (например, старая, другая по смыслу задача
-    // была заведена на ветке с тем же именем и уже смёржена) — её СТАРЫЙ merge-коммит вполне может
-    // сидеть среди обычных контекстных коммитов dev (findContextCommits ничего не знает про повторное
-    // использование имён веток) и тоже матчиться регуляркой; раньше это приводило к тому, что дорожка
-    // хватала первый попавшийся (более старый, а не текущий) merge и закрывала лейн ветки СЛИШКОМ
-    // РАНО. mergeMarker строится только из слияний, которые сервер уже подтвердил как относящиеся к
-    // ЭТОЙ ветке (см. applyMergeEvents в session.ts) — их может быть НЕСКОЛЬКО, если ветку мержили
-    // за её жизнь больше одного раза (часть коммитов влита раньше отдельным PR, часть — позже).
+    // (см. renderItems), с уже проставленным row.branch — а не любая строка, чей subject случайно
+    // похож на текст слияния. mergeMarker строится только из слияний, которые сервер уже
+    // подтвердил как относящиеся к ЭТОЙ ветке по топологии (см. applyMergeEvents в session.ts) —
+    // их может быть НЕСКОЛЬКО, если ветку мержили за её жизнь больше одного раза (часть коммитов
+    // влита раньше отдельным PR, часть — позже).
     const mergeRowsByBranch = new Map();
     merged.forEach((row, idx) => {
       if (row.kind !== 'mergeMarker') return;
-      const m = MERGE_SUBJECT_RE.exec((row.commit.subject || '').trim());
-      if (m && seenBranches.has(m[1])) {
-        if (!mergeRowsByBranch.has(m[1])) mergeRowsByBranch.set(m[1], []);
-        mergeRowsByBranch.get(m[1]).push(idx);
-      }
+      if (!seenBranches.has(row.branch)) return;
+      if (!mergeRowsByBranch.has(row.branch)) mergeRowsByBranch.set(row.branch, []);
+      mergeRowsByBranch.get(row.branch).push(idx);
     });
 
     const ranges = new Map();
@@ -1876,13 +1868,18 @@ export class ReleasePanel {
     // PR, часть — позже) — mergeEventsByBranch[branch] тогда содержит больше одного слияния, и на
     // дорожке появляется отдельная точка на стволе под каждое из них, а не только под последнее.
     const mergeEventsByBranch = currentPlan.mergeEventsByBranch || {};
-    const allMergeEvents = Object.values(mergeEventsByBranch).flat();
-    const mergeEventShas = new Set(allMergeEvents.map((ev) => ev.sha));
-    const mergeMarkerRows = allMergeEvents.map((ev) => ({
-      kind: 'mergeMarker',
-      date: ev.authorDate,
-      commit: { sha: ev.sha, subject: ev.subject, authorDate: ev.authorDate, authorName: ev.authorName, taskUrl: ev.taskUrl, prUrl: ev.prUrl, prNumber: ev.prNumber, commitUrl: ev.commitUrl },
-    }));
+    // branch — прямо из ключа mergeEventsByBranch, а не восстанавливается позже парсингом subject
+    // (см. computeRail): сервер и так знает, к какой ветке относится каждое событие, Object.entries
+    // вместо Object.values сохраняет эту связь, а не теряет её на полпути.
+    const mergeMarkerRows = Object.entries(mergeEventsByBranch).flatMap(([branch, events]) =>
+      events.map((ev) => ({
+        kind: 'mergeMarker',
+        date: ev.authorDate,
+        branch,
+        commit: { sha: ev.sha, subject: ev.subject, authorDate: ev.authorDate, authorName: ev.authorName, taskUrl: ev.taskUrl, prUrl: ev.prUrl, prNumber: ev.prNumber, commitUrl: ev.commitUrl },
+      }))
+    );
+    const mergeEventShas = new Set(mergeMarkerRows.map((row) => row.commit.sha));
     // Тот же коммит не должен показываться дважды, когда контекстные коммиты развёрнуты — один раз
     // обычной серой строкой (без PR-ссылки) и второй раз как "маркер слияния" (с ней); оставляем
     // только вторую, более информативную версию.
@@ -2116,9 +2113,13 @@ export class ReleasePanel {
       branchDiffStatByRef.clear();
       colorAssignments.clear();
       nextColorIndex = 0;
+      // selectedRefs уже пуст (см. выше), но #selectedSummary никто не перерисовал — чипы
+      // выбранных веток ПРЕЖНЕГО проекта оставались видны на экране до следующего 'branches'
+      // (который сам зовёт updateSelectedSummary), т.е. до конца загрузки списка веток нового
+      // проекта — визуальный артефакт вводил в заблуждение (будто эти ветки выбраны и сейчас).
+      updateSelectedSummary();
       renderItems();
       updateBuildButtonsState();
-      updateSyncIndicator();
     } else if (msg.command === 'currentBranch') {
       currentBranchValue = msg.current;
       renderCurrentBranchSelect();

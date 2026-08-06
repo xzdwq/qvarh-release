@@ -15,15 +15,39 @@ export interface FirstParentCommit {
   authorName: string;
 }
 
-/** Сам merge-коммит PR в Bitbucket (см. GitService.listMergeEvents) — sha этого конкретного коммита слияния, а не какого-либо коммита ветки. */
+/** Сам merge-коммит PR (см. GitService.listMergeEvents) — sha этого конкретного коммита слияния, а не какого-либо коммита ветки. */
 export interface MergeEventDetails {
   sha: string;
-  /** Родители merge-коммита — второй обычно и есть tip ветки на момент слияния; используется, чтобы понять, какие именно "свои" коммиты ветки реально вошли в это конкретное слияние (см. applyMergeEvents в session.ts). */
+  /** Родители merge-коммита — обычный (не octopus) merge всегда содержит tip слитой ветки среди них; используется, чтобы понять, какие именно "свои" коммиты ветки реально вошли в это конкретное слияние (см. applyMergeEvents в session.ts) — топология, а не текст subject. */
   parents: string[];
   subject: string;
   authorDate: string;
   authorName: string;
-  prNumber: number;
+  /** Best-effort — только для бейджа/ссылки на PR, НЕ участвует в определении самого факта слияния (см. extractPrNumber). null, если subject не совпал ни с одним известным форматом хостинга/языка. */
+  prNumber: number | null;
+}
+
+/**
+ * Известные форматы subject merge-коммита, из которых можно вытащить номер PR/MR — ЛУЧШЕЕ, ЧТО
+ * ПОЛУЧИЛОСЬ (best-effort), а не источник истины: сам факт слияния определяется топологией
+ * (см. listMergeEvents), этот список только украшает найденное слияние ссылкой на PR, если
+ * получится. Список неполный по конструкции — новый хостинг/язык интерфейса просто не даст
+ * бейджа с номером PR, но слияние всё равно найдётся и линия на графе всё равно нарисуется.
+ */
+const PR_NUMBER_PATTERNS: RegExp[] = [
+  /\(pull request #(\d+)\)/i, // Bitbucket (EN): Merged in X (pull request #42)
+  /\(pull-запрос #(\d+)\)/i, // Bitbucket (RU): Объединено в X (pull-запрос #42)
+  /^Merge pull request #(\d+) from/i, // GitHub: Merge pull request #42 from user/branch
+  /!(\d+)$/, // GitLab merge request subject обычно кончается на "...!42"
+];
+
+function extractPrNumber(subject: string): number | null {
+  const trimmed = subject.trim();
+  for (const pattern of PR_NUMBER_PATTERNS) {
+    const match = pattern.exec(trimmed);
+    if (match) return Number(match[1]);
+  }
+  return null;
 }
 
 /**
@@ -421,39 +445,52 @@ export class GitService {
   }
 
   /**
-   * Индекс "имя ветки → ВСЕ найденные merge-коммиты этой ветки в Bitbucket" (sha/родители/тема/дата/
-   * автор/номер PR), построенный ОДНИМ git-вызовом из merge-коммитов first-parent истории ref'а
-   * (обычно dev; `--merges` ограничивает выборку коммитами с 2+ родителями — иначе в подсчёт попали
-   * бы и обычные коммиты dev). Bitbucket при слиянии PR формирует merge-коммит с предсказуемым
-   * subject'ом вида "Merged in feature/PROJ-123 (pull request #42)" — данные извлекаются оттуда, без
-   * обращения к Bitbucket API (которого в этом проекте сознательно нет). Список для каждой ветки
-   * отсортирован от САМОГО СВЕЖЕГО к самому старому (порядок обхода от tip'а ref'а) — если имя ветки
-   * когда-то переиспользовалось, тут будут ВСЕ его слияния, а не только последнее; вызывающий код сам
-   * решает, какие из них относятся к текущей выборке коммитов (см. applyMergeEvents в session.ts —
-   * там это фильтруется по тому, является ли второй родитель merge-коммита известным "своим"
-   * коммитом ветки).
+   * Индекс "sha родителя → ВСЕ merge-коммиты first-parent истории ref'а (обычно dev), где этот sha
+   * — один из родителей" (sha/родители/тема/дата/автор/номер PR), построенный ОДНИМ git-вызовом
+   * (`--merges` ограничивает выборку коммитами с 2+ родителями — иначе в подсчёт попали бы и
+   * обычные коммиты dev).
    *
-   * Помимо номера PR (для бейджей — исходное назначение этой функции) сам коммит слияния нужен
-   * дорожке веток в хронологии (см. releasePanel.ts): раньше она пыталась угадать точку слияния,
-   * разбирая subject уже загруженных "контекстных" коммитов dev — ненадёжно, поскольку тот же
-   * коммит не гарантированно присутствует в контекстных коммитах (окно дат, лимит, свёрнутый
-   * список). Здесь же — один и тот же авторитетный источник для обеих задач.
+   * Раньше слияние искалось по СОВПАДЕНИЮ ИМЕНИ ВЕТКИ, разобранного из subject через regex вида
+   * "Merged in X (pull request #N)" — жёстко привязано к формату ОДНОГО хостинга на ОДНОМ языке
+   * интерфейса. Ломалось на: другом языке Bitbucket (найдено на реальном репозитории — русское
+   * "Объединено в X (pull-запрос #N)", причём в ОДНОЙ истории вперемешку с английскими — локаль
+   * аккаунта, смёржившего PR, могла меняться), GitHub ("Merge pull request #N from ..."), GitLab,
+   * обычном `git merge` без хостинга вообще — да и в принципе НИКАКОЙ subject не мог бы поймать
+   * squash-merge (там результат — обычный коммит с ОДНИМ родителем, до текста дело не доходит).
+   *
+   * Родители merge-коммита — это топология, а не текст: у обычного (не octopus, не squash) merge
+   * один из родителей ВСЕГДА равен tip'у слитой ветки на момент слияния, независимо от хостинга,
+   * языка интерфейса или того, кто вызвал `git merge` — это гарантия самого git, а не соглашение
+   * Bitbucket. Индексируя по sha родителя, вызывающий код (см. applyMergeEvents в session.ts)
+   * просто проверяет "есть ли среди родителей какой-нибудь ИЗ УЖЕ ИЗВЕСТНЫХ своих коммитов ветки"
+   * — без единой попытки понять по subject'у, что вообще произошло.
+   *
+   * prNumber в каждом событии — best-effort (см. extractPrNumber), только для бейджа/ссылки, не
+   * участвует в поиске самого слияния: если subject не подошёл ни под один известный формат,
+   * просто null — слияние всё равно найдено и попадёт на график.
+   *
+   * Сам коммит слияния (а не только номер PR) нужен дорожке веток в хронологии (см. releasePanel.ts):
+   * раньше она пыталась угадать точку слияния, разбирая subject уже загруженных "контекстных"
+   * коммитов dev — ненадёжно, поскольку тот же коммит не гарантированно присутствует в контекстных
+   * коммитах (окно дат, лимит, свёрнутый список). Здесь же — один и тот же авторитетный источник
+   * для обеих задач.
    */
   async listMergeEvents(ref: string): Promise<Map<string, MergeEventDetails[]>> {
     const format = ['%H', '%P', '%s', '%aI', '%an'].join('%x1f');
     const raw = await this.git.raw(['log', '--first-parent', '--merges', `--pretty=format:${format}`, ref]);
-    const pattern = /^Merged in (\S+) \(pull request #(\d+)\)/;
-    const index = new Map<string, MergeEventDetails[]>();
+    const byParentSha = new Map<string, MergeEventDetails[]>();
     for (const line of raw.split('\n')) {
-      const [sha, parents, subject, authorDate, authorName] = line.split('\x1f');
-      const match = subject ? pattern.exec(subject.trim()) : null;
-      if (!match) continue;
-      const [, branchName, prNumberRaw] = match;
-      const list = index.get(branchName) ?? [];
-      list.push({ sha, parents: parents.split(' ').filter(Boolean), subject, authorDate, authorName, prNumber: Number(prNumberRaw) });
-      index.set(branchName, list);
+      if (!line.trim()) continue;
+      const [sha, parentsRaw, subject, authorDate, authorName] = line.split('\x1f');
+      const parents = parentsRaw.split(' ').filter(Boolean);
+      const event: MergeEventDetails = { sha, parents, subject, authorDate, authorName, prNumber: extractPrNumber(subject ?? '') };
+      for (const parentSha of parents) {
+        const list = byParentSha.get(parentSha) ?? [];
+        list.push(event);
+        byParentSha.set(parentSha, list);
+      }
     }
-    return index;
+    return byParentSha;
   }
 
   async branchExists(name: string): Promise<boolean> {
@@ -469,12 +506,23 @@ export class GitService {
     await this.git.pull();
   }
 
-  /** Создаёт релизную ветку от baseRef. Бросает исключение, если ветка уже существует. */
+  /**
+   * Создаёт релизную ветку от baseRef. Бросает исключение, если ветка уже существует.
+   *
+   * --no-track ОБЯЗАТЕЛЕН: baseRef обычно origin/<mainBranch> (см. session.ts resolveMainRef —
+   * предпочитает remote-ветку как более свежую базу), а git при `checkout -b` от remote-ветки по
+   * умолчанию (branch.autoSetupMerge=true) сам настраивает upstream-tracking новой ветки НА ЭТУ
+   * remote-ветку. Без --no-track релизная ветка тихо начинала бы "отслеживать" main — встроенный
+   * в VS Code Source Control тогда вместо "Опубликовать ветку" показывает "Синхронизировать
+   * изменения" (раз upstream уже есть), и её нажатие пушит коммиты релизной ветки ПРЯМО в main на
+   * remote — подтверждённый на реальном инциденте баг (см. changelog): пользователь думал, что
+   * стоит на релизной ветке, а после "Синхронизировать" все её коммиты оказались в main/Bitbucket.
+   */
   async createReleaseBranch(name: string, baseRef: string): Promise<void> {
     if (await this.branchExists(name)) {
       throw new Error(`Ветка ${name} уже существует. Используйте "продолжить сборку релиза", чтобы дособрать её.`);
     }
-    await this.git.checkoutBranch(name, baseRef);
+    await this.git.raw(['checkout', '-b', name, '--no-track', baseRef]);
   }
 
   /**

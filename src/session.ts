@@ -147,7 +147,21 @@ export class ReleaseSession implements ReleasePanelHost {
     };
   }
 
-  /** Ссылка на основную ветку: origin/main, если есть, иначе локальная main — без checkout. Используется для создания релизной ветки и как база dry-run. */
+  /**
+   * Ссылка на основную ветку: ЛОКАЛЬНАЯ main, если она есть, иначе origin/main — без checkout.
+   * Используется и для создания релизной ветки, и как база проверок "уже в main" (dry-run,
+   * фоновый статус в списке веток) — важно, чтобы обе части использовали ОДНУ И ТУ ЖЕ базу:
+   * иначе релизная ветка была бы отрезана от одного main, а "уже выпущено" считалось бы по
+   * ДРУГОМУ (более свежему origin/main) — коммит мог бы тихо посчитаться "уже в main", хотя в
+   * реальной базе релизной ветки его ещё нет.
+   *
+   * Раньше было наоборот (origin/main предпочитался как более свежий) — специально ради этого и
+   * добавлена кнопка Pull в шапке панели: пользователь сам решает, когда обновить локальный main
+   * (`git pull`), и до этого момента расширение использует именно то, что реально стоит в
+   * рабочем каталоге, а не тихо подглядывает в origin за его спиной. Так удалённая ветка не может
+   * незаметно "утечь" в качестве базы релиза — что раньше приводило к путанице с upstream-
+   * tracking релизной ветки (см. GitService.createReleaseBranch).
+   */
   private async resolveMainRef(): Promise<string> {
     return this.resolveBranchRef(this.config.mainBranch);
   }
@@ -169,16 +183,19 @@ export class ReleaseSession implements ReleasePanelHost {
   }
 
   private async resolveBranchRef(branchName: string): Promise<string> {
-    const remoteRef = `${this.config.remoteName}/${branchName}`;
-    if (await this.git.refExists(remoteRef)) {
-      return remoteRef;
+    if (await this.git.refExists(branchName)) {
+      return branchName;
     }
-    return branchName;
+    // Локальной ветки нет вовсе (например, репозиторий только что клонирован и её никто не
+    // чекаутил) — тогда остаётся откатиться на remote-tracking, иначе резолвить было бы вообще
+    // не из чего.
+    return `${this.config.remoteName}/${branchName}`;
   }
 
   /**
-   * Кэширует ссылки main/dev, индекс "ветка → номер PR" и множество first-parent SHA dev-ветки —
-   * реально они меняются только вместе с состоянием репозитория (Pull/явный Refresh), а не
+   * Кэширует ссылки main/dev, индекс "sha родителя merge-коммита → merge-события" (см.
+   * GitService.listMergeEvents) и множество first-parent SHA dev-ветки — реально они меняются
+   * только вместе с состоянием репозитория (Pull/явный Refresh), а не
    * при каждом нажатии клавиши в фильтре или смене лимита показа. Раньше все три пересчитывались
    * заново на КАЖДЫЙ такой вызов — в т.ч. внутри фонового уточнения статуса "в main"
    * (runBranchMainStatusRefinePass), которое само перезапускается на каждое изменение фильтра —
@@ -513,35 +530,46 @@ export class ReleaseSession implements ReleasePanelHost {
    * расширения, ДО того, как это поле появилось, — а сериализованный JSON просто не содержит полей,
    * которых не было при сохранении), а сама dev-ветка вполне может продолжать жить и мержить ветки
    * дальше — обновляем эти данные, а не показываем их замороженными на момент последней сборки плана.
+   *
+   * Поиск слияния — по ТОПОЛОГИИ (родители merge-коммита среди уже известных "своих" коммитов
+   * ветки, см. GitService.listMergeEvents), а не по имени ветки/тексту subject: это гарантия
+   * самого git, а не соглашение конкретного хостинга или языка интерфейса. prNumber — best-effort
+   * (см. extractPrNumber в gitService.ts), может быть null, если subject не подошёл ни под один
+   * известный формат — на сам факт слияния (и линию на графе) это не влияет.
    */
-  private applyMergeEvents(items: PlanItem[], mergeEvents: Map<string, MergeEventDetails[]>): Record<string, MergeEventInfo[]> {
-    for (const item of items) {
-      item.prNumber = mergeEvents.get(item.branch)?.[0]?.prNumber ?? null;
-      Object.assign(item, this.buildLinks(item.branch, item.subject, item.sha, item.prNumber));
-    }
+  private applyMergeEvents(items: PlanItem[], mergeEventsByParentSha: Map<string, MergeEventDetails[]>): Record<string, MergeEventInfo[]> {
     const mergeEventsByBranch: Record<string, MergeEventInfo[]> = {};
     for (const branch of new Set(items.map((i) => i.branch))) {
-      // Если имя ветки когда-то уже использовалось (см. GitService.listMergeEvents), кандидатов
-      // может быть несколько — оставляем только те слияния, которые реально влили один из ИЗВЕСТНЫХ
-      // "своих" коммитов ЭТОЙ ветки (сверяем по родителям merge-коммита), а не любое совпадение по
-      // имени: иначе сюда попал бы случайный старый merge той же ветки, никак не связанный с текущей
-      // выборкой коммитов. Ветка вполне может быть смёржена НЕСКОЛЬКО РАЗ за свою жизнь (часть работы
-      // смёржена раньше, часть — позже отдельным PR) — тогда relevant содержит больше одного элемента,
-      // и дорожка веток в хронологии показывает каждое такое слияние отдельной точкой (см. renderItems).
-      const branchItemShas = new Set(items.filter((i) => i.branch === branch).map((i) => i.sha));
-      const relevant = (mergeEvents.get(branch) ?? []).filter((ev) => ev.parents.some((p) => branchItemShas.has(p)));
-      if (relevant.length === 0) continue;
-      mergeEventsByBranch[branch] = relevant
-        .slice()
-        .sort((a, b) => (a.authorDate < b.authorDate ? -1 : 1))
-        .map((ev) => ({
-          sha: ev.sha,
-          subject: ev.subject,
-          authorDate: ev.authorDate,
-          authorName: ev.authorName,
-          prNumber: ev.prNumber,
-          ...this.buildLinks(branch, ev.subject, ev.sha, ev.prNumber),
-        }));
+      const branchItems = items.filter((i) => i.branch === branch);
+      // Ветка вполне может быть смёржена НЕСКОЛЬКО РАЗ за свою жизнь (часть работы смёржена раньше,
+      // часть — позже отдельным PR) — каждый "свой" коммит ветки может оказаться родителем СВОЕГО
+      // merge-коммита, поэтому проверяем ВСЕ, а не только последний/первый. Дедуп по sha самого
+      // merge-коммита — один merge мог "поглотить" сразу несколько своих коммитов подряд, событие
+      // при этом одно и то же и не должно попасть в mergeEventsByBranch дважды.
+      const seenMergeShas = new Set<string>();
+      const relevant: MergeEventDetails[] = [];
+      for (const item of branchItems) {
+        for (const ev of mergeEventsByParentSha.get(item.sha) ?? []) {
+          if (seenMergeShas.has(ev.sha)) continue;
+          seenMergeShas.add(ev.sha);
+          relevant.push(ev);
+        }
+      }
+      const sorted = relevant.slice().sort((a, b) => (a.authorDate < b.authorDate ? -1 : 1));
+      const firstPr = sorted[0]?.prNumber ?? null;
+      for (const item of branchItems) {
+        item.prNumber = firstPr;
+        Object.assign(item, this.buildLinks(item.branch, item.subject, item.sha, firstPr));
+      }
+      if (sorted.length === 0) continue;
+      mergeEventsByBranch[branch] = sorted.map((ev) => ({
+        sha: ev.sha,
+        subject: ev.subject,
+        authorDate: ev.authorDate,
+        authorName: ev.authorName,
+        prNumber: ev.prNumber,
+        ...this.buildLinks(branch, ev.subject, ev.sha, ev.prNumber),
+      }));
     }
     return mergeEventsByBranch;
   }

@@ -154,10 +154,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   .project-row.confirm-row { background: transparent; border-color: var(--vscode-inputValidation-errorBorder); }
   .project-row.confirm-row .project-row-info { font-size: 11px; line-height: 1.4; color: var(--vscode-errorForeground); }
   /* Проект, сейчас открытый в панели сборки релиза (см. activeProject.ts) — акцентная рамка +
-     маленький бейдж "открыт", а не просто другой фон, чтобы не потерять читаемость имени поверх
-     background: var(--vscode-list-hoverBackground) у обычной строки. */
+     маленький зелёный бейдж-иконка (галочка), а не просто другой фон, чтобы не потерять
+     читаемость имени поверх background: var(--vscode-list-hoverBackground) у обычной строки.
+     Раньше бейдж был текстом "открыт" на background: var(--vscode-focusBorder) — в тёмных темах
+     этот акцентный цвет сам довольно тёмный, а color: var(--vscode-editor-background) на нём тоже
+     тёмный (фон тёмной темы) — тёмный текст на тёмном фоне читался плохо. Фиксированный зелёный +
+     белая SVG-иконка вместо текста не зависят от темы вообще. */
   .project-row.active { border-color: var(--vscode-focusBorder); border-width: 2px; padding: 6px 7px; }
-  .active-badge { font-size: 10px; font-weight: 400; opacity: 0.75; padding: 1px 6px; border-radius: 8px; background: var(--vscode-focusBorder); color: var(--vscode-editor-background); }
+  .active-badge { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; border-radius: 50%; background: var(--vscode-charts-green); flex: none; }
+  .active-badge svg { width: 9px; height: 9px; color: #fff; }
 
   .project-form {
     margin-top: 10px; padding: 10px; border-radius: 6px;
@@ -234,6 +239,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   const PROJECT_ICON = '<svg viewBox="0 0 14 14" width="14" height="14"><path d="M2 4.5L7 2l5 2.5v5L7 12 2 9.5v-5z" stroke="currentColor" stroke-width="1.1" fill="none" stroke-linejoin="round"/><path d="M2 4.5L7 7l5-2.5M7 7v5" stroke="currentColor" stroke-width="1.1" fill="none" stroke-linejoin="round"/></svg>';
   const FOLDER_ICON = '<svg viewBox="0 0 14 14" width="14" height="14"><path d="M1.5 3.5h4l1 1.2h6v6.3h-11z" stroke="currentColor" stroke-width="1.1" fill="none" stroke-linejoin="round"/></svg>';
   const GIT_ICON = '<svg viewBox="0 0 16 16" width="14" height="14"><path d="M4 3 L4 13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/><path d="M4 6.2 C7 6.2 7 8 11 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/><circle cx="4" cy="3" r="1.6" fill="currentColor"/><circle cx="4" cy="13" r="1.6" fill="currentColor"/><circle cx="12" cy="8" r="1.6" fill="currentColor"/></svg>';
+  // Бейдж "сейчас открыт" (см. .active-badge) — белая галочка, а не текст: цвет фиксированный
+  // (currentColor берёт color: #fff у .active-badge svg), не зависит от темы.
+  const CHECK_ICON = '<svg viewBox="0 0 10 10" title="Открыт в панели сборки релиза"><path d="M2 5.2 L4.2 7.4 L8 2.8" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
   let projects = [];
   let editingProjectId = null;
@@ -275,7 +283,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       return \`
       <div class="project-row\${isActive ? ' active' : ''}">
         <div class="project-row-info">
-          <div class="project-row-name">\${PROJECT_ICON}\${escapeHtml(p.name)}\${isActive ? '<span class="active-badge">открыт</span>' : ''}</div>
+          <div class="project-row-name">\${PROJECT_ICON}\${escapeHtml(p.name)}\${isActive ? \`<span class="active-badge">\${CHECK_ICON}</span>\` : ''}</div>
           <div class="project-row-path">\${FOLDER_ICON}\${escapeHtml(p.repositoryPath)}</div>
         </div>
         <button class="start-icon" data-action="start" data-id="\${p.id}" title="\${startTitle}" \${formOpen ? 'disabled' : ''}>\${GIT_ICON}</button>
