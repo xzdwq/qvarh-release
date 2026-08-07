@@ -290,18 +290,33 @@ export class ReleaseSession implements ReleasePanelHost {
 
   /**
    * Если включено (по умолчанию — см. hideDuplicateRemoteBranches в config.ts), скрывает
-   * REMOTE-TRACKING ветку из списка, если для неё существует ЛОКАЛЬНАЯ пара с тем же именем —
-   * иначе большинство веток репозитория показывались бы дважды подряд (feature/PROJ-123 и
-   * origin/feature/PROJ-123), почти всегда указывая на один и тот же коммит. Локальная версия
-   * оставляется как основная: типичный сценарий работы с расширением — сначала Pull (checkout +
-   * pull) нужной ветки, дальше работа идёт именно с локальной веткой, а не с remote-tracking.
+   * REMOTE-TRACKING ветку из списка, если для неё существует ЛОКАЛЬНАЯ пара с тем же именем И
+   * ТЕМ ЖЕ последним коммитом — иначе большинство веток репозитория показывались бы дважды подряд
+   * (feature/PROJ-123 и origin/feature/PROJ-123), почти всегда указывая на один и тот же коммит.
+   * Локальная версия оставляется как основная: типичный сценарий работы с расширением — сначала
+   * Pull (checkout + pull) нужной ветки, дальше работа идёт именно с локальной веткой, а не с
+   * remote-tracking.
+   *
+   * СРАВНЕНИЕ SHA ОБЯЗАТЕЛЬНО — раньше ветки считались "дубликатом" просто по совпадению ИМЕНИ, а
+   * не факту, что это реально один и тот же коммит. Подтверждено на реальном случае: локальная
+   * feature/DOS-2615 годами не обновлялась (последний коммит — от совсем другой задачи, чей-то
+   * старый checkout под тем же именем) и указывала на коммит, уже полностью влитый в dev сам по
+   * себе — у неё попросту НЕТ "своих" коммитов относительно dev. Реальная, актуальная работа по
+   * DOS-2615 была только в origin/feature/DOS-2615 — но та молча скрывалась этим фильтром, раз
+   * локальная "пара" с тем же именем формально существовала. Пользователь выбирал то, что видел
+   * в списке (сталую локальную), получал "нет коммитов" и пустую хронологию — не баг построения
+   * плана, а то, что реальная ветка с реальными коммитами вообще не попадала в список для выбора.
+   * Если локальная и remote-tracking ветки расходятся (в любую сторону — локальная позади,
+   * впереди или на другой линии) — показываем ОБЕ, а не гадаем, какая "правильнее": несовпадение
+   * само по себе полезный сигнал (видно по превью последнего коммита в списке, какая из них
+   * актуальна), молчаливое скрытие — нет.
    */
   private applyDuplicateBranchFilter(branches: BranchRef[]): BranchRef[] {
     if (!this.config.hideDuplicateRemoteBranches) {
       return branches;
     }
-    const localNames = new Set(branches.filter((b) => !b.isRemote).map((b) => b.name));
-    return branches.filter((b) => !b.isRemote || !localNames.has(b.name));
+    const localShaByName = new Map(branches.filter((b) => !b.isRemote).map((b) => [b.name, b.lastCommitSha]));
+    return branches.filter((b) => !b.isRemote || localShaByName.get(b.name) !== b.lastCommitSha);
   }
 
   /**
@@ -549,18 +564,22 @@ export class ReleaseSession implements ReleasePanelHost {
       const seenMergeShas = new Set<string>();
       const relevant: MergeEventDetails[] = [];
       for (const item of branchItems) {
-        for (const ev of mergeEventsByParentSha.get(item.sha) ?? []) {
+        // PR конкретного коммита — это PR того merge-коммита, который ЕГО реально поглотил
+        // (т.е. у которого item.sha — родитель), а не "первый по дате" PR ветки: при нескольких
+        // слияниях одной ветки разные коммиты уходят в разные PR (см. mergeEventsByParentSha).
+        const ownEvents = (mergeEventsByParentSha.get(item.sha) ?? [])
+          .slice()
+          .sort((a, b) => (a.authorDate < b.authorDate ? -1 : 1));
+        const own = ownEvents[0];
+        item.prNumber = own?.prNumber ?? null;
+        Object.assign(item, this.buildLinks(item.branch, item.subject, item.sha, item.prNumber));
+        for (const ev of ownEvents) {
           if (seenMergeShas.has(ev.sha)) continue;
           seenMergeShas.add(ev.sha);
           relevant.push(ev);
         }
       }
       const sorted = relevant.slice().sort((a, b) => (a.authorDate < b.authorDate ? -1 : 1));
-      const firstPr = sorted[0]?.prNumber ?? null;
-      for (const item of branchItems) {
-        item.prNumber = firstPr;
-        Object.assign(item, this.buildLinks(item.branch, item.subject, item.sha, firstPr));
-      }
       if (sorted.length === 0) continue;
       mergeEventsByBranch[branch] = sorted.map((ev) => ({
         sha: ev.sha,
@@ -947,7 +966,7 @@ export class ReleaseSession implements ReleasePanelHost {
   /** Pull ТЕКУЩЕЙ (уже выбранной через onSwitchBranch) ветки — без параметра имени и без checkout. */
   async onPullCurrentBranch(): Promise<void> {
     await this.git.assertClean();
-    await this.git.pull();
+    await this.git.pull(this.config.remoteName);
     await this.postCurrentBranch();
     await this.refreshBranches();
   }

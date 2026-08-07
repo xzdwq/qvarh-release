@@ -502,7 +502,31 @@ export class GitService {
     await this.git.checkout(name);
   }
 
-  async pull(): Promise<void> {
+  /**
+   * Обычный git pull для уже выбранной (текущей) ветки. Если у неё нет upstream-tracking (ветка
+   * создана локально без --track, или потеряла привязку — например, то же "устаревшая локальная
+   * ветка" из GitService.applyDuplicateBranchFilter в session.ts) — голый `git pull` без
+   * аргументов отказывается работать вообще ("There is no tracking information for the current
+   * branch"), хотя remote-ветка с ТЕМ ЖЕ именем скорее всего существует: иначе зачем бы
+   * пользователь стоял на этой ветке и жал Pull. Проверяем upstream ЗАРАНЕЕ (через @{u}, а не
+   * парсингом текста ошибки — он не зависит от локали git) и, если его нет, а remoteName/<ветка>
+   * существует, настраиваем upstream на неё перед пуллом — ровно то же самое действие, которое
+   * сама git и предлагает сделать вручную (`git branch --set-upstream-to=...`), просто
+   * автоматически: имя совпадает однозначно, гадать здесь не о чём. Если подходящей remote-ветки
+   * нет вовсе — просто пуллим как обычно и получаем настоящую (уже осмысленную) ошибку git.
+   */
+  async pull(remoteName: string): Promise<void> {
+    const hasUpstream = await this.git
+      .raw(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'])
+      .then(() => true)
+      .catch(() => false);
+    if (!hasUpstream) {
+      const branch = await this.currentBranch();
+      const remoteRef = `${remoteName}/${branch}`;
+      if (branch && (await this.refExists(remoteRef))) {
+        await this.git.raw(['branch', `--set-upstream-to=${remoteRef}`, branch]);
+      }
+    }
     await this.git.pull();
   }
 
