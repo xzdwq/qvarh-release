@@ -276,7 +276,7 @@ export class ReleaseSession implements ReleasePanelHost {
     this.refsCache = null; // состояние репозитория могло поменяться (Pull/явный Refresh) — см. getRefsCache
     this.fullBranches = this.applyDuplicateBranchFilter(await this.git.listBranches());
     this.postReleaseBranchPatternCount();
-    await this.sendBranchSlice('');
+    await this.sendBranchSlice('', true);
   }
 
   /** Сколько веток в репозитории подходят под шаблон релизной ветки (releaseBranchPattern) — общая
@@ -364,7 +364,7 @@ export class ReleaseSession implements ReleasePanelHost {
    * пакетных git-вызова, а не по вызову на ветку), фильтруем, и только потом режем по лимиту.
    * Без "скрыть" — как раньше, статус считается уже после среза, только для показанных строк.
    */
-  private async sendBranchSlice(filterText: string): Promise<void> {
+  private async sendBranchSlice(filterText: string, refreshedGitState = false): Promise<void> {
     this.lastFilterQuery = filterText;
     this.branchSliceGeneration += 1;
     const generation = this.branchSliceGeneration;
@@ -407,7 +407,10 @@ export class ReleaseSession implements ReleasePanelHost {
     if (generation !== this.branchSliceGeneration || !this.isActive()) return;
 
     const sliceWithFlags = slice.map((b) => {
-      const prNumber = mergeEvents.get(b.name)?.[0]?.prNumber ?? null;
+      // mergeEvents — Map по SHA родителя (см. GitService.listMergeEvents), а не по имени ветки:
+      // PR последнего коммита ветки ищем по его собственному sha, а не по имени.
+      const ownEvents = mergeEvents.get(b.lastCommitSha) ?? [];
+      const prNumber = ownEvents.slice().sort((a, c) => (a.authorDate < c.authorDate ? -1 : 1))[0]?.prNumber ?? null;
       // Только 'none'/'full' — по последнему коммиту ветки, дёшево (см. MainStatus в types.ts).
       // 'partial' панель уточняет сама на клиенте после разворачивания коммитов конкретной ветки.
       const mainStatus: 'none' | 'full' = fastStatusByRef.get(b.ref) ? 'full' : 'none';
@@ -424,6 +427,7 @@ export class ReleaseSession implements ReleasePanelHost {
       totalBranches: this.fullBranches.length,
       truncated: candidates.length > slice.length,
       limit,
+      refreshedGitState,
     });
 
     void this.refineBranchMainStatus(slice, devRef, mainRef, devFirstParentShas, generation);

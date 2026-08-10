@@ -9,6 +9,14 @@ export interface BranchListInfo {
   truncated: boolean;
   /** Текущий лимит показа веток — чтобы панель могла предзаполнить своё поле "Показывать веток". */
   limit: number;
+  /**
+   * true только когда список пришёл из refreshBranches() (Pull/явный "Обновить список веток") —
+   * единственного места, где состояние репозитория реально могло измениться (см. getRefsCache в
+   * session.ts). При фильтрации/смене лимита остаётся false — там git-состояние не трогали, и
+   * ранее уточнённый статус "в main" (branchMainStatusOverride на клиенте) всё ещё актуален,
+   * пересчитывать его заново незачем.
+   */
+  refreshedGitState: boolean;
 }
 
 export interface ReleasePanelHost {
@@ -2183,6 +2191,15 @@ export class ReleasePanel {
       // скрипта (тот самый первый запрос мог улететь раньше, чем сервер успел построить список
       // веток, и вернуться с заведомо пустым/неполным результатом).
       requestReleaseDateCheck();
+      if (msg.info.refreshedGitState) {
+        // Pull/явный "Обновить список веток" — состояние репозитория могло измениться (например,
+        // ветка, которой не было в main, теперь там есть после Pull master). Уточнённый статус "в
+        // main" с ФОНОВОГО прохода ДО этого момента (branchMainStatusOverride) мог считаться по
+        // устаревшему состоянию и был бы приоритетнее свежего b.mainStatus ниже (см.
+        // effectiveMainStatus) — сбрасываем, фоновый проход подтянет точный статус заново.
+        branchMainStatusOverride.clear();
+        branchDiffStatByRef.clear();
+      }
       currentBranches = msg.branches;
       for (const b of msg.branches) branchNameByRef.set(b.ref, b.name);
       // Выбор веток — состояние клиента; из сервера принимаем его только один раз при первом
