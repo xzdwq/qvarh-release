@@ -58,6 +58,13 @@ function extractPrNumber(subject: string): number | null {
  */
 const PATCH_ID_CHUNK_SIZE = 200;
 
+/**
+ * Насколько глубоко обходим назад собственную first-parent историю релизной ветки в поисках
+ * границы с предыдущим релизом (см. resolveReleaseBranchBaseRef) — запас на случай, если несколько
+ * релизов подряд ушли в main fast-forward'ом без единого merge-коммита между ними.
+ */
+const RELEASE_BRANCH_FF_BOUNDARY_WALK_CAP = 2000;
+
 export class GitConflictError extends Error {
   constructor(message: string, public readonly sha: string) {
     super(message);
@@ -288,6 +295,22 @@ export class GitService {
   async refExists(ref: string): Promise<boolean> {
     try {
       await this.git.revparse(['--verify', `${ref}^{commit}`]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * true, если ancestorRef реально находится в истории descendantRef (`git merge-base --is-ancestor`)
+   * — дёшево (без диффов). Используется, чтобы отличить "релизная ветка уже полностью выпущена в
+   * main" (см. loadReleaseBranchOwnCommits в session.ts) от "релизная ветка ещё пустая, просто
+   * ничего пока не собрано" — в обоих случаях releaseBranchOwnCommits(releaseBranch, mainRef)
+   * одинаково вернёт 0 коммитов, но причины принципиально разные.
+   */
+  async isAncestor(ancestorRef: string, descendantRef: string): Promise<boolean> {
+    try {
+      await this.git.raw(['merge-base', '--is-ancestor', ancestorRef, descendantRef]);
       return true;
     } catch {
       return false;
@@ -873,21 +896,31 @@ export class GitService {
   }
 
   /**
-   * Собственные коммиты релизной ветки — всё, что в ней есть, а в mainRef нет. Используется, когда
-   * для найденной релизной ветки нет сохранённого плана (см. loadReleaseBranchOwnCommits в
-   * session.ts) — например, ветку создали в старой версии расширения без сохранения состояния,
-   * или вручную — чтобы всё равно показать, какие задачи в ней уже реально есть. Простой `--not
-   * mainRef`, а не resolveBranchOwnCommits из planner.ts (там форк-поинт/повторное использование
-   * имён учитываются намеренно сложнее — актуально для feature-веток относительно dev; релизная
-   * ветка создаётся линейно от main, этой сложности здесь нет).
+   * Собственные коммиты релизной ветки — всё, что в ней есть, а в mainRef (точнее — в состоянии
+   * main НЕПОСРЕДСТВЕННО ПЕРЕД тем, как эта ветка в него влилась, см. resolveReleaseBranchBaseRef)
+   * нет. Используется, когда для найденной релизной ветки нет сохранённого плана (см.
+   * loadReleaseBranchOwnCommits/tryReconstructPlanFromReleaseBranch в session.ts) — например, ветку
+   * создали в старой версии расширения без сохранения состояния, или вручную, или релиз уже выпущен
+   * в main, а через день-два в ТУ ЖЕ ветку докидывают забытую задачу — чтобы всё равно показать,
+   * какие задачи в ней уже реально есть.
+   *
+   * otherReleaseBranchTips — sha кончиков ДРУГИХ, уже существующих релизных веток (см.
+   * releaseBranchMatcher в session.ts) — нужен resolveReleaseBranchBaseRef для случая, когда ЭТА
+   * ветка влилась в main fast-forward'ом (без отдельного merge-коммита именно для неё).
    */
-  async releaseBranchOwnCommits(releaseBranch: string, mainRef: string, maxCount: number): Promise<FirstParentCommit[]> {
+  async releaseBranchOwnCommits(
+    releaseBranch: string,
+    mainRef: string,
+    maxCount: number,
+    otherReleaseBranchTips: Set<string> = new Set()
+  ): Promise<FirstParentCommit[]> {
+    const baseRef = await this.resolveReleaseBranchBaseRef(releaseBranch, mainRef, otherReleaseBranchTips);
     const format = ['%H', '%P', '%s', '%aI', '%an'].join('%x1f');
     const raw = await this.git.raw([
       'log',
       releaseBranch,
       '--not',
-      mainRef,
+      baseRef,
       '--no-merges',
       `--max-count=${maxCount}`,
       `--pretty=format:${format}%x1e`,
@@ -900,5 +933,90 @@ export class GitService {
         const [sha, parents, subject, authorDate, authorName] = entry.split('\x1f');
         return { sha, parents: parents.split(' ').filter(Boolean), subject, authorDate, authorName };
       });
+  }
+
+  /**
+   * Простое `git log releaseBranch --not mainRef` вырождается в пустоту, как только релизная ветка
+   * реально влилась в main (fast-forward или обычный merge — с этого момента её кончик становится
+   * АНЦЕСТОРОМ main, и `--not mainRef` перестаёт видеть в ней хоть что-то "своё", хотя коммиты
+   * реально там есть) — подтверждено на реальном репозитории: релиз, влитый ВЧЕРА через обычный
+   * merge-коммит ("Merged in release/X (pull request #N)"), после слияния показывал 0 "своих"
+   * коммитов, хотя их там 3.
+   *
+   * Вместо текущего mainRef ищем в first-parent истории main САМ merge-коммит, который влил ЭТУ
+   * ветку (по топологии — родитель = кончик релизной ветки, та же техника, что и
+   * GitService.listMergeEvents для веток относительно dev) — и берём его ПЕРВОГО родителя: это и
+   * есть состояние main непосредственно ДО поглощения ветки, относительно которого сравнение снова
+   * работает как обычная ancestry-проверка.
+   *
+   * Если такого merge-коммита нет, но кончик релизной ветки всё равно уже предок main (влита
+   * fast-forward'ом, без отдельного merge-коммита — подтверждено на реальном примере: релиз,
+   * ушедший в main через fast-forward, до этой ветки первым же исправлением показывал 0 "своих"
+   * коммитов, хотя их 5) — идём по СОБСТВЕННОЙ first-parent истории релизной ветки от кончика назад
+   * и ищем ближайший (самый свежий) merge-коммит, у которого хотя бы один НЕ-первый родитель —
+   * это кончик КАКОЙ-ТО ДРУГОЙ, реально существующей релизной ветки (otherReleaseBranchTips,
+   * передаётся вызывающим кодом — session.ts знает шаблон имени релизных веток, GitService не
+   * обязан): это и есть merge-коммит, которым в main влился ПРЕДЫДУЩИЙ релиз, то есть граница с
+   * тем, что было в main до старта ЭТОЙ ветки — при fast-forward'е собственная история ветки и
+   * часть истории main совпадают буквально, поэтому искать можно по любой из них.
+   *
+   * Более простые сигналы здесь НЕДОСТАТОЧНЫ — оба подтверждены на реальном примере:
+   * "ближайший коммит с 2+ родителями" в принципе — между двумя релизами в main нашёлся обычный
+   * административный merge ("Merge branch 'main' of github.com:.../... into main" — синхронизация
+   * с апстримом), из-за чего "своими" ошибочно считались 200+ чужих коммитов вместо 5 своих;
+   * "ближайший merge с любым распознанным номером PR" (extractPrNumber) — тоже недостаточно: на
+   * пути попался merge совсем другой, не релизной задачи, тоже прошедший через PR хостинга
+   * ("Объединено в release (pull-запрос #339)" — не имеет отношения к released/release-YYYY-MM-DD).
+   * Только явное совпадение с кончиком РЕАЛЬНО СУЩЕСТВУЮЩЕЙ релизной ветки — это гарантия топологии
+   * git, а не подверженное чужим PR совпадение текста.
+   *
+   * Если ветка вовсе не влита никуда, или влита fast-forward'ом без единого предыдущего релиза (с
+   * ещё существующей веткой) в пределах глубины обхода — используем mainRef как есть, ничего не
+   * меняется (самый частый случай — ветка ещё не выпущена).
+   */
+  private async resolveReleaseBranchBaseRef(
+    releaseBranch: string,
+    mainRef: string,
+    otherReleaseBranchTips: Set<string>
+  ): Promise<string> {
+    try {
+      const releaseTip = await this.resolveRef(releaseBranch);
+      const mainMergeEvents = await this.listMergeEvents(mainRef);
+      // listMergeEvents индексирует merge-событие по ВСЕМ его родителям, а не только по тому,
+      // который реально "влился" — releaseTip может совпасть с ПЕРВЫМ родителем совершенно
+      // ДРУГОГО, более позднего merge-коммита (main просто продолжила свою линию оттуда дальше)
+      // — подтверждено на реальном примере: кончик release-2026-08-04 оказался ПЕРВЫМ родителем
+      // merge-коммита СЛЕДУЮЩЕГО релиза (release-2026-08-11), из-за чего baseRef ошибочно
+      // становился самим releaseTip, а "своих" коммитов — 0. Реальное "влилась именно ЭТА ветка"
+      // — только когда releaseTip НЕ первый родитель (обычный второй родитель merge, см.
+      // GitService.listMergeEvents/applyMergeEvents в session.ts — та же конвенция).
+      const mergeEvent = (mainMergeEvents.get(releaseTip) ?? []).find((ev) => ev.parents[0] !== releaseTip);
+      if (mergeEvent) {
+        return mergeEvent.parents[0];
+      }
+      if (await this.isAncestor(releaseBranch, mainRef)) {
+        // firstParentChain возвращает коммиты от САМОГО СТАРОГО к самому свежему (см. её докстринг
+        // и planner.ts resolveBranchOwnCommits, который по той же причине идёт по массиву в обратном
+        // порядке) — обходим с конца (от кончика релизной ветки), а не с начала: иначе находится
+        // первый совпавший merge СО СТОРОНЫ САМОЙ СТАРОЙ истории, а не ближайший к кончику (
+        // подтверждено на реальном примере: наивный обход с начала находил случайный merge
+        // трёхлетней давности вместо merge-коммита предыдущего релиза, состоявшегося днями раньше).
+        const { commits } = await this.firstParentChain(releaseTip, RELEASE_BRANCH_FF_BOUNDARY_WALK_CAP);
+        let boundary: FirstParentCommit | undefined;
+        for (let i = commits.length - 1; i >= 0; i--) {
+          const c = commits[i];
+          if (c.sha !== releaseTip && c.parents.length > 1 && c.parents.slice(1).some((p) => otherReleaseBranchTips.has(p))) {
+            boundary = c;
+            break;
+          }
+        }
+        if (boundary) {
+          return boundary.sha;
+        }
+      }
+      return mainRef;
+    } catch {
+      return mainRef;
+    }
   }
 }

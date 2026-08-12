@@ -186,9 +186,11 @@ export class ReleasePanel {
    */
   postReleaseBranchInfo(
     releaseBranch: string,
-    commits: Array<{ sha: string; subject: string; authorDate: string; authorName: string; taskUrl: string | null; prUrl: string | null; commitUrl: string | null }>
+    commits: Array<{ sha: string; subject: string; authorDate: string; authorName: string; taskUrl: string | null; prUrl: string | null; commitUrl: string | null }>,
+    /** Короткое объяснение, когда commits пуст — почему (уже выпущена в main / ещё пустая) — см. session.ts loadReleaseBranchOwnCommits. */
+    note: string | null = null
   ): void {
-    this.panel.webview.postMessage({ command: 'releaseBranchInfo', releaseBranch, commits });
+    this.panel.webview.postMessage({ command: 'releaseBranchInfo', releaseBranch, commits, note });
   }
 
   /** Сколько веток в репозитории подходят под шаблон релизной ветки — общая картина наверху панели, см. session.ts postReleaseBranchPatternCount. */
@@ -231,6 +233,31 @@ export class ReleasePanel {
 
   postPlan(plan: ReleasePlan | null): void {
     this.panel.webview.postMessage({ command: 'planBuilt', plan });
+  }
+
+  /**
+   * Принудительно перезаписывает выбор веток на клиенте — в отличие от selectedRefs внутри
+   * 'branches' (см. postBranches), который клиент принимает только ОДИН раз при первом открытии
+   * панели (дальше это состояние клиента, чтобы фильтрация/лимит не сбрасывали чекбоксы). Нужно,
+   * когда СЕРВЕР сам меняет выбор ПОСЛЕ того, как первое 'branches' уже ушло — единственный такой
+   * случай сейчас: реконструкция хронологии по существующей релизной ветке (см. session.ts
+   * tryReconstructPlanFromReleaseBranch) находит и авто-выбирает ветки уже ПОСЛЕ refreshBranches().
+   * Без этого чекбоксы найденных веток не отмечались бы в списке, и повторное "Построить
+   * хронологию" (например, чтобы добавить забытую задачу) отправило бы на сервер выбор БЕЗ них,
+   * стирая уже восстановленную историю.
+   */
+  postSelectedRefs(refs: string[]): void {
+    this.panel.webview.postMessage({ command: 'selectedRefs', refs });
+  }
+
+  /**
+   * Лоадер на блок хронологии, когда её (пере)строит сама сессия, а не клик по "Построить
+   * хронологию" — например, при попадании на уже существующую релизную ветку (см. session.ts
+   * prepareReleaseBranchAdoption/finishApplyingPlan). Переиспользует тот же клиентский индикатор
+   * (setBuildPlanBusy), что и обычная кнопка — planBuilt/error уже гасят его как обычно.
+   */
+  postPlanBuilding(): void {
+    this.panel.webview.postMessage({ command: 'planBuilding' });
   }
 
   postProgress(event: ExecutorEvent): void {
@@ -1115,6 +1142,17 @@ export class ReleasePanel {
   // 'currentBranch' ниже) и настроенная основная/dev ветка гарантированно попадают в список, даже
   // если их не видно в текущем срезе (иначе выбор мог бы "потерять" ветку, на которой мы стоим).
   let currentBranchValue = '';
+  // Последний ответ на 'checkReleaseDate' (см. onCheckReleaseDate в session.ts) — реактивно
+  // пересчитывает disabled у "Создать релизную ветку" при ЛЮБОМ изменении currentBranchValue, а
+  // не только когда сам сервер явно переспрашивает дату: onStartBuilding создаёт/чекаутит ветку и
+  // шлёт свежий 'currentBranch', но НЕ переспрашивает checkReleaseDate заново — без этой реактивной
+  // привязки кнопка молча оставалась активной до следующего изменения поля даты.
+  let lastReleaseDateCheck = { branchName: null, exists: false };
+  function updateCreateBranchBtnState() {
+    document.getElementById('createBranchBtn').disabled =
+      lastReleaseDateCheck.exists ||
+      (!!lastReleaseDateCheck.branchName && currentBranchValue === lastReleaseDateCheck.branchName);
+  }
   function renderCurrentBranchSelect() {
     const names = new Set(currentBranches.map((b) => b.name));
     [currentBranchValue, configMainBranch, configDevBranch].forEach((n) => n && names.add(n));
@@ -1354,17 +1392,53 @@ export class ReleasePanel {
     vscode.postMessage({ command: 'startBuilding', releaseDate: document.getElementById('releaseDate').value.trim() });
   });
 
-  document.getElementById('startBtn').addEventListener('click', () => vscode.postMessage({ command: 'startAuto' }));
-  document.getElementById('publishBtn').addEventListener('click', () => vscode.postMessage({ command: 'publishRelease' }));
+  // startBusy/publishBusy — busy-состояние самой длительной операции (реальный cherry-pick/push),
+  // а не построения хронологии (то отдельно, см. setBuildPlanBusy) — пока идёт, кнопка недоступна
+  // и показывает спиннер, чтобы не выглядело, будто расширение зависло.
+  let startBusy = false;
+  let publishBusy = false;
+
+  document.getElementById('startBtn').addEventListener('click', () => {
+    startBusy = true;
+    document.getElementById('startBtn').innerHTML = '<span class="inline-loading">Собираем…</span>';
+    updateBuildButtonsState();
+    vscode.postMessage({ command: 'startAuto' });
+  });
+  document.getElementById('publishBtn').addEventListener('click', () => {
+    publishBusy = true;
+    document.getElementById('publishBtn').innerHTML = '<span class="inline-loading">Публикуем…</span>';
+    updateBuildButtonsState();
+    vscode.postMessage({ command: 'publishRelease' });
+  });
 
   // Единый источник правды для состояния сборки — считается из currentPlan.items (included/applied),
   // а не из отдельного клиентского флага, поэтому всегда актуален и после полной пересборки плана
   // (planBuilt), и после каждого шага применения (см. 'progress' ниже, где applied проставляется
   // на конкретном item без пересборки всего плана).
   function updateBuildButtonsState() {
-    const ready = !!(currentPlan && currentPlan.releaseBranch);
-    document.getElementById('startBtn').disabled = !ready;
-    if (ready) {
+    const hasReleaseBranch = !!(currentPlan && currentPlan.releaseBranch);
+    // releaseBranch сам по себе не значит "есть что собирать" — emptyPlanFor (см. session.ts)
+    // заводит план с пустым items ещё до того, как хронология реально построена/восстановлена
+    // (например, релизная ветка уже полностью выпущена в main — см. releaseBranchInfo). Без этой
+    // проверки "Начать сборку" была бы активна и кликабельна, хотя нечего применять.
+    const hasItems = hasReleaseBranch && currentPlan.items.length > 0;
+    // Отдельно от hasItems: сама хронология может быть непустой, но ПОЛНОСТЬЮ уже применённой
+    // (например, релизная ветка восстановлена по факту git-истории — см. tryReconstructPlanFromReleaseBranch
+    // в session.ts — и все её коммиты уже отмечены applied, новых веток не добавляли) — applyAll
+    // (executor.ts) в этом случае фильтрует всё до пустого списка и ничего не делает, поэтому кнопка
+    // должна быть недоступна, а не просто "не пустая".
+    const hasPending = hasItems && currentPlan.items.some((i) => i.included && !i.applied);
+    const startBtn = document.getElementById('startBtn');
+    startBtn.disabled = !hasPending || startBusy;
+    if (!startBusy) {
+      // Если что-то в плане уже реально применено (в т.ч. восстановлено при попадании на
+      // существующую релизную ветку, см. planBuilt/applied) — "Продолжить сборку" точнее
+      // отражает реальность, чем "Начать сборку". Пустая свежесозданная ветка — по дефолту
+      // "Начать сборку" (hasItems=true, но applied ни у одного пункта ещё нет).
+      startBtn.textContent = hasItems && currentPlan.items.some((i) => i.applied) ? 'Продолжить сборку' : 'Начать сборку';
+    }
+    document.getElementById('publishBtn').disabled = publishBusy;
+    if (hasReleaseBranch) {
       document.getElementById('releaseBranchStatus').textContent = 'Релизная ветка: ' + currentPlan.releaseBranch;
     } else {
       // currentPlan.releaseBranch пуст просто потому, что сборка в ЭТОЙ сессии/плане ещё не
@@ -1378,8 +1452,16 @@ export class ReleasePanel {
 
     const statusEl = document.getElementById('buildStatus');
     const publishRow = document.getElementById('publishRow');
-    if (!ready) {
+    if (!hasReleaseBranch) {
       statusEl.textContent = '';
+      publishRow.style.display = 'none';
+      return;
+    }
+    if (!hasItems) {
+      // ПОЧЕМУ пусто (уже выпущена в main / просто пока пустая) объясняет releaseBranchInfo — здесь
+      // нейтральный статус, без слова "отмеченных": это подразумевало бы, что коммиты есть, просто
+      // не выбраны, а тут их вовсе нет.
+      statusEl.textContent = 'В хронологии нет коммитов.';
       publishRow.style.display = 'none';
       return;
     }
@@ -2140,7 +2222,8 @@ export class ReleasePanel {
       shaToBranch = new Map();
       document.getElementById('releaseBranchInfo').innerHTML = '';
       releaseBranchPatternCount = null;
-      document.getElementById('createBranchBtn').disabled = false;
+      lastReleaseDateCheck = { branchName: null, exists: false };
+      updateCreateBranchBtnState();
       showError('');
       document.getElementById('branchList').innerHTML = '<div class="muted branch-list-loading">Загрузка веток…</div>';
       document.getElementById('branchListInfo').textContent = 'Загрузка списка веток…';
@@ -2177,6 +2260,7 @@ export class ReleasePanel {
     } else if (msg.command === 'currentBranch') {
       currentBranchValue = msg.current;
       renderCurrentBranchSelect();
+      updateCreateBranchBtnState();
       configMainBranch = msg.mainBranch;
       configDevBranch = msg.devBranch;
       staleBranchesLookbackReleases = msg.staleBranchesLookbackReleases;
@@ -2258,6 +2342,19 @@ export class ReleasePanel {
         branchMainStatusOverride.set(msg.ref, matched === 0 ? 'none' : matched === msg.commits.length ? 'full' : 'partial');
       }
       renderBranches();
+    } else if (msg.command === 'selectedRefs') {
+      // Сервер сам поменял выбор ПОСЛЕ первого 'branches' (реконструкция хронологии по
+      // существующей релизной ветке, см. session.ts tryReconstructPlanFromReleaseBranch) —
+      // безусловно перезаписываем клиентское selectedRefs, а не только при первом открытии.
+      selectedRefs = new Set(msg.refs);
+      selectionInitialized = true;
+      renderBranches();
+      updateSelectedSummary();
+    } else if (msg.command === 'planBuilding') {
+      // Сессия сама (пере)строит хронологию — попадание на уже существующую релизную ветку (см.
+      // session.ts prepareReleaseBranchAdoption), а не клик по кнопке. planBuilt/error ниже гасят
+      // тот же индикатор как обычно.
+      setBuildPlanBusy(true);
     } else if (msg.command === 'planBuilt') {
       setBuildPlanBusy(false);
       currentPlan = msg.plan;
@@ -2286,8 +2383,8 @@ export class ReleasePanel {
       // Не трогаем текст статуса, если уже есть готовый план (см. updateBuildButtonsState — там
       // же он сам покажет "Релизная ветка: X"/прогресс сборки) — иначе просмотр другой даты в поле
       // затирал бы актуальный статус уже идущей сборки текстом про эту, ещё не выбранную дату.
-      const btn = document.getElementById('createBranchBtn');
-      btn.disabled = msg.exists;
+      lastReleaseDateCheck = { branchName: msg.branchName, exists: msg.exists };
+      updateCreateBranchBtnState();
       const ready = !!(currentPlan && currentPlan.releaseBranch);
       if (!ready) {
         document.getElementById('releaseBranchStatus').textContent = msg.exists
@@ -2297,7 +2394,10 @@ export class ReleasePanel {
     } else if (msg.command === 'releaseBranchInfo') {
       const el = document.getElementById('releaseBranchInfo');
       if (!msg.commits || msg.commits.length === 0) {
-        el.innerHTML = '';
+        // note объясняет, ПОЧЕМУ пусто — уже полностью выпущена в main, или просто пока ничего не
+        // собрано (см. session.ts loadReleaseBranchOwnCommits) — без него молчание выглядит так,
+        // будто расширение просто не нашло ветку/зависло, хотя на самом деле ей нечего показать.
+        el.innerHTML = msg.note ? \`<div class="muted">\${escapeHtml(msg.note)}</div>\` : '';
       } else {
         const rows = msg.commits.map((c) => {
           const link = c.commitUrl ? \`<a href="\${c.commitUrl}" target="_blank" rel="noopener">\${c.sha.slice(0,8)}</a>\` : c.sha.slice(0,8);
@@ -2324,22 +2424,32 @@ export class ReleasePanel {
         renderItems();
         updateBuildButtonsState();
       } else if (ev.type === 'conflict') {
+        // Терминальное состояние этого вызова onStartAuto() — сервер уже вернул промис, кнопка не занята.
+        startBusy = false;
         showError(
           'Конфликт на коммите ' + ev.item.sha.slice(0,8) + ' ("' + ev.item.subject + '"). ' +
           'Разрешите конфликт в файлах репозитория и нажмите "Начать сборку" ещё раз — сборка продолжится с этого же места.'
         );
         updateBuildButtonsState();
       } else if (ev.type === 'done') {
+        startBusy = false;
         showError('');
         updateBuildButtonsState();
       }
     } else if (msg.command === 'published') {
+      publishBusy = false;
+      updateBuildButtonsState();
       document.getElementById('buildStatus').innerHTML =
         '<span style="color:var(--vscode-charts-green);">✓ Релизная ветка опубликована (запушена в remote).</span>';
     } else if (msg.command === 'error') {
       setBuildPlanBusy(false);
       setRefreshBusy(false);
       setPullBusy(false);
+      // startAuto/publishRelease бросили исключение — их промис на сервере уже завершился этой
+      // ошибкой, кнопки не должны оставаться занятыми навсегда.
+      startBusy = false;
+      publishBusy = false;
+      updateBuildButtonsState();
       showError(msg.message);
     }
   });
