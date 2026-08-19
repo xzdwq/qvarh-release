@@ -1148,10 +1148,18 @@ export class ReleasePanel {
   // шлёт свежий 'currentBranch', но НЕ переспрашивает checkReleaseDate заново — без этой реактивной
   // привязки кнопка молча оставалась активной до следующего изменения поля даты.
   let lastReleaseDateCheck = { branchName: null, exists: false };
+  // Пока идёт реальное создание/checkout ветки (см. click-хендлер ниже) — кнопка недоступна и
+  // показывает спиннер, чтобы не выглядело, будто расширение зависло на клике.
+  let createBranchBusy = false;
   function updateCreateBranchBtnState() {
-    document.getElementById('createBranchBtn').disabled =
+    const btn = document.getElementById('createBranchBtn');
+    btn.disabled =
+      createBranchBusy ||
       lastReleaseDateCheck.exists ||
       (!!lastReleaseDateCheck.branchName && currentBranchValue === lastReleaseDateCheck.branchName);
+    if (!createBranchBusy) {
+      btn.textContent = 'Создать релизную ветку';
+    }
   }
   function renderCurrentBranchSelect() {
     const names = new Set(currentBranches.map((b) => b.name));
@@ -1389,6 +1397,10 @@ export class ReleasePanel {
 
   document.getElementById('createBranchBtn').addEventListener('click', () => {
     showError('');
+    createBranchBusy = true;
+    const btn = document.getElementById('createBranchBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="inline-loading">Создаём…</span>';
     vscode.postMessage({ command: 'startBuilding', releaseDate: document.getElementById('releaseDate').value.trim() });
   });
 
@@ -1437,7 +1449,15 @@ export class ReleasePanel {
       // "Начать сборку" (hasItems=true, но applied ни у одного пункта ещё нет).
       startBtn.textContent = hasItems && currentPlan.items.some((i) => i.applied) ? 'Продолжить сборку' : 'Начать сборку';
     }
-    document.getElementById('publishBtn').disabled = publishBusy;
+    const publishBtn = document.getElementById('publishBtn');
+    publishBtn.disabled = publishBusy;
+    if (!publishBusy) {
+      // В отличие от startBtn, текст этой кнопки не меняется по данным плана — единственная
+      // причина, по которой innerHTML отличается от дефолтного, это спиннер "Публикуем…",
+      // выставленный в её же click-хендлере. Без явного восстановления кнопка навсегда
+      // оставалась бы с текстом "Публикуем…", даже вернувшись в кликабельное состояние.
+      publishBtn.textContent = 'Опубликовать релизную ветку';
+    }
     if (hasReleaseBranch) {
       document.getElementById('releaseBranchStatus').textContent = 'Релизная ветка: ' + currentPlan.releaseBranch;
     } else {
@@ -2258,6 +2278,9 @@ export class ReleasePanel {
       renderItems();
       updateBuildButtonsState();
     } else if (msg.command === 'currentBranch') {
+      // Надёжный сигнал, что onStartBuilding (если это он вызвал текущий 'currentBranch')
+      // закончил создание/checkout ветки — сессия шлёт его сразу после этого, ДО postPlan.
+      createBranchBusy = false;
       currentBranchValue = msg.current;
       renderCurrentBranchSelect();
       updateCreateBranchBtnState();
@@ -2445,11 +2468,13 @@ export class ReleasePanel {
       setBuildPlanBusy(false);
       setRefreshBusy(false);
       setPullBusy(false);
-      // startAuto/publishRelease бросили исключение — их промис на сервере уже завершился этой
-      // ошибкой, кнопки не должны оставаться занятыми навсегда.
+      // startAuto/publishRelease/startBuilding бросили исключение — их промис на сервере уже
+      // завершился этой ошибкой, кнопки не должны оставаться занятыми навсегда.
       startBusy = false;
       publishBusy = false;
+      createBranchBusy = false;
       updateBuildButtonsState();
+      updateCreateBranchBtnState();
       showError(msg.message);
     }
   });
