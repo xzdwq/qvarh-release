@@ -1,4 +1,6 @@
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
+import * as fs from 'fs/promises';
+import * as path from 'path';
 import simpleGit, { SimpleGit } from 'simple-git';
 import { BranchRef } from '../core/types';
 
@@ -48,6 +50,40 @@ function extractPrNumber(subject: string): number | null {
     if (match) return Number(match[1]);
   }
   return null;
+}
+
+/**
+ * Тот же формат ключа задачи (например PROJ-123), что и extractTaskKey в config.ts — дублируется
+ * здесь намеренно, а не импортируется: config.ts тянет vscode (readProjects/saveProjects), а
+ * gitService.ts специально держится без единой vscode-зависимости (уже проверялось отдельной
+ * сборкой этого файла при диагностике — см. историю правок). Если формат ключа задачи когда-нибудь
+ * изменится, поправить нужно в обоих местах.
+ */
+const TASK_KEY_PATTERN = /\b([A-Z][A-Z0-9]+-\d+)\b/;
+
+function extractTaskKeyLocal(text: string): string | null {
+  const match = TASK_KEY_PATTERN.exec(text);
+  return match ? match[1] : null;
+}
+
+/** Сколько строк каждой стороны конфликта показывать в UI (см. ConflictHunk) — защита от аномально большого hunk'а. */
+const CONFLICT_HUNK_PREVIEW_LINES = 20;
+
+function normalizeForCompare(line: string): string {
+  return line.trim().replace(/\s+/g, ' ');
+}
+
+/**
+ * "Наша" и "их" версии текстуально совпадают после нормализации пробелов и отбрасывания пустых
+ * строк — то есть конфликт вызван не РЕАЛЬНЫМ текстовым различием, а несовпадением контекста
+ * 3-way merge (например, рядом успела сдвинуться пустая строка) — можно спокойно принять любую
+ * сторону при разрешении.
+ */
+function linesEqualIgnoringWhitespace(a: string[], b: string[]): boolean {
+  const na = a.map(normalizeForCompare).filter((l) => l !== '');
+  const nb = b.map(normalizeForCompare).filter((l) => l !== '');
+  if (na.length !== nb.length) return false;
+  return na.every((l, i) => l === nb[i]);
 }
 
 /**
@@ -839,12 +875,13 @@ export class GitService {
   }
 
   /**
-   * Последний коммит, менявший конкретный файл в истории ref'а — используется сразу после
-   * обнаружения dry-run конфликта (см. performDryRun), пока рабочий каталог worktree ещё в
-   * состоянии "прямо перед конфликтом" (HEAD = main + всё, что уже успешно применено ранее в
-   * этом же прогоне): это и есть настоящий, а не угаданный по эвристике, источник конфликта —
-   * тот, кто последним трогал файл до попытки применить конфликтующий коммит. Возвращает null,
-   * если файл в истории ref'а не встречается (например, файл только что создан этим коммитом).
+   * Последний коммит, менявший конкретный файл в истории ref'а — ГРУБЫЙ фолбэк для
+   * analyzeConflictSource, когда точный анализ по конкретным строкам конфликта невозможен
+   * (бинарный файл, не удалось распарсить маркеры конфликта). "Последний, кто трогал файл ВООБЩЕ"
+   * может указывать на совершенно другое место того же файла и вводить в заблуждение — подтверждено
+   * на реальном примере (см. analyzeConflictSource) — поэтому это больше не основной путь.
+   * Возвращает null, если файл в истории ref'а не встречается (например, файл только что создан
+   * этим коммитом).
    */
   async lastCommitTouchingFile(ref: string, file: string): Promise<FirstParentCommit | null> {
     const format = ['%H', '%P', '%s', '%aI', '%an'].join('%x1f');
@@ -855,6 +892,361 @@ export class GitService {
     }
     const [sha, parents, subject, authorDate, authorName] = trimmed.split('\x1f');
     return { sha, parents: parents.split(' ').filter(Boolean), subject, authorDate, authorName };
+  }
+
+  /**
+   * Настоящий (не эвристический) анализ ОДНОГО файла dry-run конфликта — вызывается сразу после
+   * обнаружения конфликта (см. performDryRun), пока файл в worktree ещё содержит маркеры
+   * `<<<<<<<`/`=======`/`>>>>>>>` (до `cherry-pick --abort`).
+   *
+   * Шаг 1 — какие именно строки конфликтуют (parseConflictMarkerRanges), а не "последний коммит,
+   * менявший файл вообще": тот мог трогать совсем другое место того же файла (подтверждено на
+   * реальном примере — файл с историей до 2023 года, где "последний коммит" указывал на недавнюю,
+   * но никак не связанную с конфликтом правку в другом месте файла).
+   *
+   * Шаг 2 — git blame по ЭТИМ строкам на baseRef (blamePrimaryCommit) — кто РЕАЛЬНО в ответе за
+   * содержимое, из-за которого не сошёлся конфликт.
+   *
+   * Шаг 3 — findTaskDivergence: если у найденного коммита есть ключ задачи в subject, ищем на dev
+   * коммит с тем же ключом. Если находится и это РЕАЛЬНО другой коммит (не совпадающий sha) — это
+   * тот самый случай "задача есть в обеих ветках, но как разные коммиты" (см. TaskDivergence в
+   * types.ts): расхождение истории, а не забытая ветка и не случайное пересечение правок.
+   *
+   * Если маркеры не удалось распарсить (бинарный файл и т.п.) — откат на lastCommitTouchingFile,
+   * без taskDivergence (точных строк конфликта нет — искать по ним нечего).
+   */
+  async analyzeConflictSource(
+    worktreePath: string,
+    file: string,
+    baseRef: string,
+    devRef: string,
+    itemSha: string
+  ): Promise<{
+    sha: string | null;
+    subject: string | null;
+    authorName: string | null;
+    authorDate: string | null;
+    hunks: Array<{
+      oursText: string[];
+      theirsText: string[];
+      sameContent: boolean;
+      oursStartLine: number | null;
+      theirsStartLine: number | null;
+    }>;
+    taskDivergence: {
+      taskKey: string;
+      contentMatch: 'identical' | 'near-identical' | 'different';
+      otherSha: string;
+      otherSubject: string;
+      otherAuthorName: string;
+      otherAuthorDate: string;
+    } | null;
+  }> {
+    const blocks = await this.parseConflictBlocks(worktreePath, file).catch(() => []);
+    // Номера строк — "наша" сторона ищется в baseRef, "их" сторона — в самом конфликтующем
+    // коммите (itemSha): это его собственная версия файла, там теми же строками, что и в блоке
+    // конфликта. Если сторона пуста (например, коммит просто удаляет строку — см. реальный пример
+    // в docstring выше) — номер для неё не показываем (isContentMatch=false), а не подсовываем
+    // позицию соседней "внешней" строки контекста, будто она и есть содержимое этой стороны.
+    const oursLocations = await Promise.all(
+      blocks.map((block) => this.locateInCleanFile(baseRef, file, block.oursLines, block.contextBefore, block.contextAfter))
+    );
+    const theirsLocations = await Promise.all(
+      blocks.map((block) => this.locateInCleanFile(itemSha, file, block.theirsLines, block.contextBefore, block.contextAfter))
+    );
+    // Сырой текст конфликта — независимо от того, получится ли ниже определить коммит-автора:
+    // "наша"/"их" версии и совпадают ли они с точностью до пробелов видны и сами по себе, без
+    // единого дополнительного git-вызова — это уже прочитанный файл worktree.
+    const hunks = blocks.map((block, i) => ({
+      oursText: block.oursLines.slice(0, CONFLICT_HUNK_PREVIEW_LINES),
+      theirsText: block.theirsLines.slice(0, CONFLICT_HUNK_PREVIEW_LINES),
+      sameContent: linesEqualIgnoringWhitespace(block.oursLines, block.theirsLines),
+      oursStartLine: oursLocations[i]?.isContentMatch ? oursLocations[i]!.start : null,
+      theirsStartLine: theirsLocations[i]?.isContentMatch ? theirsLocations[i]!.start : null,
+    }));
+
+    try {
+      const ranges = oursLocations.filter((r): r is { start: number; end: number; isContentMatch: boolean } => r !== null);
+      const blamed = ranges.length > 0 ? await this.blamePrimaryCommit(baseRef, file, ranges) : null;
+      if (!blamed) {
+        const fallback = await this.lastCommitTouchingFile('HEAD', file);
+        return {
+          sha: fallback?.sha ?? null,
+          subject: fallback?.subject ?? null,
+          authorName: fallback?.authorName ?? null,
+          authorDate: fallback?.authorDate ?? null,
+          hunks,
+          taskDivergence: null,
+        };
+      }
+      const taskDivergence = await this.findTaskDivergence(devRef, file, blamed.sha, blamed.subject);
+      return {
+        sha: blamed.sha,
+        subject: blamed.subject,
+        authorName: blamed.authorName,
+        authorDate: blamed.authorDate,
+        hunks,
+        taskDivergence,
+      };
+    } catch {
+      // Мягкий отказ — dry-run уже нашёл сам конфликт, эта диагностика необязательна.
+      const fallback = await this.lastCommitTouchingFile('HEAD', file).catch(() => null);
+      return {
+        sha: fallback?.sha ?? null,
+        subject: fallback?.subject ?? null,
+        authorName: fallback?.authorName ?? null,
+        authorDate: fallback?.authorDate ?? null,
+        hunks,
+        taskDivergence: null,
+      };
+    }
+  }
+
+  /**
+   * "Наша" половина каждого блока конфликта (между `<<<<<<<` и `=======` в файле worktree, ещё до
+   * abort) — содержимое, из-за которого не сошёлся конфликтующий коммит, плюс по одной строке
+   * контекста сразу СНАРУЖИ маркеров (нужны, если "наша" половина пуста — конфликт "добавление
+   * против добавления" — и как подсказка для disambiguation при поиске в чистом файле, см.
+   * locateInCleanFile). Возвращает ТЕКСТ, а не номера строк: cherry-pick заранее применяет все
+   * НЕконфликтующие hunk'и того же коммита по всему файлу, поэтому абсолютные номера строк в этом,
+   * уже частично изменённом файле, НЕ соответствуют номерам строк в чистом baseRef — подтверждено на
+   * реальном примере (более ранние hunk'и того же коммита добавили +43 строки выше конфликта).
+   */
+  private async parseConflictBlocks(
+    worktreePath: string,
+    file: string
+  ): Promise<
+    Array<{ oursLines: string[]; theirsLines: string[]; contextBefore: string | null; contextAfter: string | null }>
+  > {
+    let content: string;
+    try {
+      content = await fs.readFile(path.join(worktreePath, file), 'utf8');
+    } catch {
+      return []; // файл удалён/бинарный/недоступен — фолбэк на lastCommitTouchingFile
+    }
+    const lines = content.split('\n').map((l) => l.replace(/\r$/, ''));
+    const blocks: Array<{ oursLines: string[]; theirsLines: string[]; contextBefore: string | null; contextAfter: string | null }> = [];
+    let oursStartIdx: number | null = null;
+    let theirsStartIdx: number | null = null;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].startsWith('<<<<<<<')) {
+        oursStartIdx = i + 1;
+      } else if (lines[i].startsWith('=======') && oursStartIdx !== null) {
+        theirsStartIdx = i + 1;
+      } else if (lines[i].startsWith('>>>>>>>') && oursStartIdx !== null && theirsStartIdx !== null) {
+        blocks.push({
+          oursLines: lines.slice(oursStartIdx, theirsStartIdx - 1),
+          theirsLines: lines.slice(theirsStartIdx, i),
+          contextBefore: oursStartIdx > 0 ? lines[oursStartIdx - 1] : null,
+          contextAfter: i + 1 < lines.length ? lines[i + 1] : null,
+        });
+        oursStartIdx = null;
+        theirsStartIdx = null;
+      }
+    }
+    return blocks;
+  }
+
+  /**
+   * Находит, каким СТРОКАМ чистого файла на ref (без маркеров конфликта — например, baseRef перед
+   * cherry-pick) соответствует блок конфликта — по СОДЕРЖИМОМУ, а не по номерам строк из
+   * конфликтующего файла (см. parseConflictBlocks). Если "наша" половина пуста — ищет по строке
+   * контекста снаружи маркеров как по узкому, но валидному якорю. Возвращает null, если найти
+   * однозначное совпадение не удалось (например, контент успел разойтись ещё сильнее, чем можно
+   * было ожидать) — вызывающий код должен мягко откатиться на менее точный фолбэк.
+   */
+  private async locateInCleanFile(
+    ref: string,
+    file: string,
+    needleLines: string[],
+    contextBefore: string | null,
+    contextAfter: string | null
+  ): Promise<{ start: number; end: number; isContentMatch: boolean } | null> {
+    let cleanContent: string;
+    try {
+      cleanContent = await this.git.raw(['show', `${ref}:${file}`]);
+    } catch {
+      return null; // файла нет на ref (например, конфликтующий коммит его создаёт)
+    }
+    const cleanLines = cleanContent.split('\n').map((l) => l.replace(/\r$/, ''));
+
+    const isContentMatch = needleLines.length > 0;
+    const needle = isContentMatch ? needleLines : [contextBefore ?? contextAfter ?? ''];
+    if (needle.length === 1 && needle[0] === '') return null;
+
+    const matches: number[] = [];
+    for (let i = 0; i + needle.length <= cleanLines.length; i++) {
+      let ok = true;
+      for (let j = 0; j < needle.length; j++) {
+        if (cleanLines[i + j] !== needle[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) matches.push(i);
+    }
+    if (matches.length === 0) return null;
+
+    // Несколько совпадений (короткая/частая строка-якорь) — пробуем уточнить по контексту СНАРУЖИ
+    // блока, который в конфликтующем файле остаётся неизменным с обеих сторон.
+    let bestIdx = matches[0];
+    if (matches.length > 1) {
+      const withContext = matches.filter((i) => {
+        const beforeOk = contextBefore === null || cleanLines[i - 1] === contextBefore;
+        const afterOk = contextAfter === null || cleanLines[i + needle.length] === contextAfter;
+        return beforeOk && afterOk;
+      });
+      if (withContext.length > 0) bestIdx = withContext[0];
+    }
+    return { start: bestIdx + 1, end: bestIdx + needle.length, isContentMatch };
+  }
+
+  /**
+   * git blame по нескольким диапазонам строк сразу (обычно один, но конфликт может состоять из
+   * нескольких hunk'ов) — суммирует, какому коммиту принадлежит больше всего строк во ВСЕХ
+   * диапазонах разом, и возвращает его (при равенстве — более свежий по author date). Порядковый
+   * (не полный) формат porcelain: метаданные коммита (author/summary/...) присылаются только при
+   * ПЕРВОМ упоминании его sha в выводе — повторные строки того же коммита идут без них, поэтому
+   * метаданные накапливаются по ходу разбора, а не читаются заново на каждой строке.
+   */
+  private async blamePrimaryCommit(
+    ref: string,
+    file: string,
+    ranges: Array<{ start: number; end: number }>
+  ): Promise<FirstParentCommit | null> {
+    const lineCounts = new Map<string, number>();
+    const meta = new Map<string, { subject: string; authorName: string; authorDate: string }>();
+
+    for (const range of ranges) {
+      let raw: string;
+      try {
+        raw = await this.git.raw(['blame', `-L${range.start},${range.end}`, '--porcelain', ref, '--', file]);
+      } catch {
+        continue; // диапазон мог не найтись (например, файл короче на baseRef) — пропускаем, не роняем весь анализ
+      }
+      const lines = raw.split('\n');
+      let currentSha: string | null = null;
+      for (const line of lines) {
+        const header = /^([0-9a-f]{40}) \d+ \d+(?: \d+)?$/.exec(line);
+        if (header) {
+          currentSha = header[1];
+          lineCounts.set(currentSha, (lineCounts.get(currentSha) ?? 0) + 1);
+          continue;
+        }
+        if (!currentSha) continue;
+        if (line.startsWith('author ') && !meta.has(currentSha)) {
+          meta.set(currentSha, { subject: '', authorName: line.slice('author '.length), authorDate: '' });
+        } else if (line.startsWith('author-time ')) {
+          const existing = meta.get(currentSha);
+          if (existing && !existing.authorDate) {
+            existing.authorDate = new Date(Number(line.slice('author-time '.length)) * 1000).toISOString();
+          }
+        } else if (line.startsWith('summary ')) {
+          const existing = meta.get(currentSha);
+          if (existing && !existing.subject) {
+            existing.subject = line.slice('summary '.length);
+          }
+        }
+      }
+    }
+
+    if (lineCounts.size === 0) return null;
+
+    let bestSha: string | null = null;
+    let bestCount = -1;
+    let bestDate = '';
+    for (const [sha, count] of lineCounts) {
+      const date = meta.get(sha)?.authorDate ?? '';
+      if (count > bestCount || (count === bestCount && date > bestDate)) {
+        bestSha = sha;
+        bestCount = count;
+        bestDate = date;
+      }
+    }
+    if (!bestSha) return null;
+    const info = meta.get(bestSha);
+    if (!info) return null;
+    return { sha: bestSha, parents: [], subject: info.subject, authorDate: info.authorDate, authorName: info.authorName };
+  }
+
+  /**
+   * Ищет на dev коммит с тем же ключом задачи, что и у найденного blame-коммита на main — история
+   * ОДНОГО файла (дёшево, ограничено его собственным числом коммитов, а не всем dev — см. замеры
+   * при обсуждении этой фичи). Из нескольких найденных кандидатов (задачу могли докручивать в
+   * несколько раундов) берёт того, у кого содержимое файла на момент коммита ближе всего сошлось
+   * с содержимым на момент blame-коммита (см. diffContentMatch) — 'identical'/'near-identical'
+   * приоритетнее 'different', при равенстве — более свежий.
+   */
+  private async findTaskDivergence(
+    devRef: string,
+    file: string,
+    blamedSha: string,
+    blamedSubject: string
+  ): Promise<{
+    taskKey: string;
+    contentMatch: 'identical' | 'near-identical' | 'different';
+    otherSha: string;
+    otherSubject: string;
+    otherAuthorName: string;
+    otherAuthorDate: string;
+  } | null> {
+    const taskKey = extractTaskKeyLocal(blamedSubject);
+    if (!taskKey) return null;
+
+    const format = ['%H', '%s', '%aI', '%an'].join('%x1f');
+    let raw: string;
+    try {
+      raw = await this.git.raw(['log', `--pretty=format:${format}`, devRef, '--', file]);
+    } catch {
+      return null;
+    }
+    const candidates = raw
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const [sha, subject, authorDate, authorName] = line.split('\x1f');
+        return { sha, subject, authorDate, authorName };
+      })
+      .filter((c) => c.sha !== blamedSha && extractTaskKeyLocal(c.subject) === taskKey);
+    if (candidates.length === 0) return null;
+
+    const rank = { identical: 0, 'near-identical': 1, different: 2 } as const;
+    let best: (typeof candidates)[number] | null = null;
+    let bestMatch: 'identical' | 'near-identical' | 'different' = 'different';
+    for (const candidate of candidates) {
+      const match = await this.diffContentMatch(blamedSha, candidate.sha, file);
+      if (!best || rank[match] < rank[bestMatch] || (rank[match] === rank[bestMatch] && candidate.authorDate > best.authorDate)) {
+        best = candidate;
+        bestMatch = match;
+      }
+    }
+    if (!best) return null;
+    return {
+      taskKey,
+      contentMatch: bestMatch,
+      otherSha: best.sha,
+      otherSubject: best.subject,
+      otherAuthorName: best.authorName,
+      otherAuthorDate: best.authorDate,
+    };
+  }
+
+  /**
+   * Сравнивает СОДЕРЖИМОЕ файла на момент двух конкретных коммитов (не идентичность самих
+   * коммитов) — `git diff --numstat` для точных изменений, `git diff -w --ignore-blank-lines
+   * --numstat` без пробельных различий И различий, состоящих целиком из пустых строк (`-w` одного
+   * без `--ignore-blank-lines` НЕ считает добавленную/удалённую пустую строку "пробельным"
+   * отличием — это отдельный, не входящий в неё случай, подтверждено на реальном примере: два
+   * коммита одной задачи на main и dev отличались РОВНО одной пустой строкой, и `-w` сам по себе
+   * этого не считал "пробельным" отличием). 0 изменений — 'identical'; ненулевые изменения, но 0 с
+   * учётом обоих флагов — 'near-identical'; иначе — 'different'.
+   */
+  private async diffContentMatch(shaA: string, shaB: string, file: string): Promise<'identical' | 'near-identical' | 'different'> {
+    const raw = await this.git.raw(['diff', '--numstat', shaA, shaB, '--', file]).catch(() => '');
+    if (!raw.trim()) return 'identical';
+    const rawTrivial = await this.git.raw(['diff', '-w', '--ignore-blank-lines', '--numstat', shaA, shaB, '--', file]).catch(() => '');
+    return rawTrivial.trim() ? 'different' : 'near-identical';
   }
 
   /**

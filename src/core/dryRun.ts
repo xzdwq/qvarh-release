@@ -6,8 +6,6 @@ import { ConflictSource, DryRunResult, PlanItem } from './types';
 
 export interface DryRunOutcome {
   results: DryRunResult[];
-  /** Индекс (в переданном массиве items) коммита, на котором остановились из-за конфликта, либо null если всё применилось чисто */
-  stoppedAt: number | null;
 }
 
 /**
@@ -26,8 +24,11 @@ export interface DryRunOutcome {
  * что-то применено, вызывающий код (см. runDryRunOnCurrentPlan в session.ts) передаёт СЮДА именно
  * её — тогда симуляция оставшихся пунктов идёт от того состояния, что будет в реальности при
  * следующем "Начать сборку", а не от main, где часть контекста может отсутствовать.
+ *
+ * devRef нужен только для более точной диагностики самого конфликта (см.
+ * GitService.analyzeConflictSource/findTaskDivergence) — на исход dry-run (ok/conflict/empty) не влияет.
  */
-export async function performDryRun(git: GitService, baseRef: string, items: PlanItem[]): Promise<DryRunOutcome> {
+export async function performDryRun(git: GitService, baseRef: string, devRef: string, items: PlanItem[]): Promise<DryRunOutcome> {
   const included = items.filter((i) => i.included && !i.applied);
   const tmpDir = path.join(os.tmpdir(), `qvarh-release-dryrun-${crypto.randomUUID()}`);
 
@@ -35,11 +36,58 @@ export async function performDryRun(git: GitService, baseRef: string, items: Pla
   const worktreeGit = new GitService(tmpDir);
 
   const results: DryRunResult[] = [];
-  let stoppedAt: number | null = null;
+  // Файлы, чьё итоговое содержимое в этом прогоне НЕ определено: их правит коммит, который мы не
+  // смогли применить (реальный конфликт, после которого сделан abort) или уже пропустили как
+  // 'conditional'/'untested'. Ключ — файл, значение — ветки (PlanItem.branch) всех ещё не
+  // разрешённых коммитов, которые его трогают.
+  //
+  // Ветка важна: несколько СВОИХ коммитов одной ветки — это последовательная, непрерывная история
+  // (второй написан НА ОСНОВЕ первого) — как при rebase, где обычно достаточно разрешить конфликт
+  // один раз, а дальнейшие коммиты той же цепочки применяются вслед за этим уже чисто. Поэтому
+  // пересечение файлов только со своей же веткой — это не независимый риск, а ожидаемое продолжение
+  // ("решите конфликт выше — и это применится вслед за ним"), и предупреждать здесь не о чём
+  // (реального теста всё равно не будет — тестировать больше нечем, worktree после abort не содержит
+  // изменений этого файла вообще). А вот пересечение файлов с ЧУЖОЙ, независимой веткой — настоящая
+  // неопределённость: та ветка не связана с этой историей, и то, что получится в файле после вашего
+  // разрешения, нельзя предсказать заранее — это и есть 'conditional'.
+  const blockedFiles = new Map<string, Set<string>>();
+  const addBlocked = (item: PlanItem) => {
+    for (const f of item.files) {
+      const owners = blockedFiles.get(f) ?? new Set<string>();
+      owners.add(item.branch);
+      blockedFiles.set(f, owners);
+    }
+  };
 
   try {
-    for (let i = 0; i < included.length; i++) {
-      const item = included[i];
+    for (const item of included) {
+      const foreignBlockers = new Set<string>();
+      const foreignFiles: string[] = [];
+      let sameBranchOnly = false;
+      for (const f of item.files) {
+        const owners = blockedFiles.get(f);
+        if (!owners) continue;
+        const foreign = [...owners].filter((b) => b !== item.branch);
+        if (foreign.length > 0) {
+          foreignFiles.push(f);
+          foreign.forEach((b) => foreignBlockers.add(b));
+        } else {
+          sameBranchOnly = true;
+        }
+      }
+      if (foreignFiles.length > 0) {
+        results.push({ sha: item.sha, status: 'conditional', conflictFiles: foreignFiles, conflictSources: [] });
+        addBlocked(item);
+        continue;
+      }
+      if (sameBranchOnly) {
+        // Продолжение своей же, ещё не разрешённой цепочки — не проверяем (нечем), но и не пугаем
+        // "возможным конфликтом": реального независимого риска здесь нет (см. комментарий выше).
+        results.push({ sha: item.sha, status: 'untested', conflictFiles: [], conflictSources: [] });
+        addBlocked(item);
+        continue;
+      }
+
       try {
         const outcome = await worktreeGit.cherryPickIntegrationCommit({
           sha: item.sha,
@@ -52,27 +100,33 @@ export async function performDryRun(git: GitService, baseRef: string, items: Pla
       } catch (err) {
         if (err instanceof GitConflictError) {
           const conflictFiles = await worktreeGit.conflictedFiles();
-          // Смотрим "кто последним трогал файл" ДО abort — HEAD ещё в состоянии "main + всё, что
-          // уже успешно применено в этом прогоне", т.е. ровно то состояние, с которым реально не
-          // сошёлся конфликтующий коммит. Настоящая причина, а не догадка по пересечению файлов.
+          // Анализируем файл ДО abort — файл в worktree ещё содержит маркеры конфликта, по которым
+          // GitService.analyzeConflictSource находит ТОЧНЫЕ конфликтующие строки (а не "последний
+          // коммит, менявший файл вообще") и, если получится, коммит с той же задачей на dev.
           const conflictSources: ConflictSource[] = await Promise.all(
             conflictFiles.map(async (file): Promise<ConflictSource> => {
-              const last = await worktreeGit.lastCommitTouchingFile('HEAD', file);
+              const analysis = await worktreeGit.analyzeConflictSource(tmpDir, file, baseRef, devRef, item.sha);
               return {
                 file,
-                sha: last?.sha ?? null,
-                subject: last?.subject ?? null,
-                authorName: last?.authorName ?? null,
-                authorDate: last?.authorDate ?? null,
+                sha: analysis.sha,
+                subject: analysis.subject,
+                authorName: analysis.authorName,
+                authorDate: analysis.authorDate,
                 commitUrl: null, // проставляется в session.ts (buildLinks) — ядро не знает о конфиге ссылок
+                hunks: analysis.hunks,
+                taskDivergence: analysis.taskDivergence ? { ...analysis.taskDivergence, otherCommitUrl: null } : null, // otherCommitUrl — тоже session.ts
                 possibleCauses: [], // заполняется в session.ts (findConflictCauses) — там же есть конфиг/список веток
               };
             })
           );
           results.push({ sha: item.sha, status: 'conflict', conflictFiles, conflictSources });
-          stoppedAt = i;
           await worktreeGit.cherryPickAbort();
-          break;
+          // Весь диф коммита (не только сами конфликтующие файлы) — после abort ни один из его
+          // файлов реально не применён, а другие файлы того же коммита могли примениться БЕЗ
+          // конфликта до того, как cherry-pick остановился на первом же спорном месте; после
+          // настоящего разрешения (в реальности, не в этом прогоне) они всё-таки попадут в дерево.
+          addBlocked(item);
+          continue;
         }
         throw err;
       }
@@ -81,5 +135,5 @@ export async function performDryRun(git: GitService, baseRef: string, items: Pla
     await git.removeWorktree(tmpDir);
   }
 
-  return { results, stoppedAt };
+  return { results };
 }

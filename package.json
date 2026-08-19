@@ -2,7 +2,7 @@
   "name": "qvarh-release",
   "displayName": "Qvarh Release Builder",
   "description": "Сборка, проверка и выпуск релизов из локальных веток",
-  "version": "0.53.0",
+  "version": "0.58.0",
   "publisher": "xzdwq",
   "author": "xzdwq",
   "private": true,

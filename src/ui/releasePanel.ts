@@ -332,6 +332,7 @@ export class ReleasePanel {
   .conflict-summary-top { font-size: 11px; padding: 2px 8px; border-radius: 10px; display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
   .conflict-summary-top.ok { background: color-mix(in srgb, var(--vscode-charts-green) 20%, transparent); color: var(--vscode-charts-green); }
   .conflict-summary-top.bad { background: var(--vscode-charts-red); color: #fff; }
+  .conflict-summary-top.conditional { background: var(--vscode-charts-yellow, #E2C08D); color: #000; }
   /* Кнопки-действия, встроенные ПРЯМО в кликабельный заголовок карточки (Очистить, Сбросить
      копирование, кнопка синхронизации) — иначе клик по ним сработал бы и как клик по самому
      заголовку (см. stopPropagation в их обработчиках), поэтому визуально мельче обычных кнопок,
@@ -411,6 +412,11 @@ export class ReleasePanel {
   .badge.overlap { background: var(--vscode-charts-orange); color: #000; }
   .badge.ok { background: var(--vscode-charts-green); color: #000; }
   .badge.conflict { background: var(--vscode-charts-red); color: #fff; }
+  /* Условный конфликт (см. DryRunStatus 'conditional' в types.ts) — не подтверждённый git'ом факт,
+     как обычный красный конфликт, а честная неопределённость ("не проверялось, зависит от того,
+     как разрешите более ранний конфликт по тому же файлу") — отдельный жёлтый цвет и значок, чтобы
+     не путать с настоящим конфликтом. */
+  .badge.conditional { background: var(--vscode-charts-yellow, #E2C08D); color: #000; }
   .badge.applied { background: var(--vscode-charts-blue); color: #fff; }
   .badge.inmain { background: var(--vscode-charts-purple, #B37FEB); color: #000; }
   .badge.partial-inmain { background: var(--vscode-charts-yellow, #E2C08D); color: #000; }
@@ -424,9 +430,41 @@ export class ReleasePanel {
   .branch-commits { margin: 4px 0 4px 0; padding-left: 8px; border-left: 2px solid var(--qr-card-border); }
   .branch-commit-row { font-size: 11px; padding: 2px 0; }
   .conflict-details { margin-top: 4px; padding-left: 8px; border-left: 2px solid var(--vscode-charts-red); }
+  .conditional-details { margin-top: 4px; padding-left: 8px; border-left: 2px solid var(--vscode-charts-yellow, #E2C08D); font-size: 11px; }
+  .conflict-file-block + .conflict-file-block { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--qr-card-border); }
   .conflict-file { font-size: 11px; padding: 2px 0; }
+  .conflict-file-toggle { cursor: pointer; user-select: none; }
+  .conflict-file-toggle:hover { text-decoration: underline; }
+  .conflict-file-arrow { display: inline-block; width: 12px; }
+  .conflict-file-body { display: none; container-type: inline-size; }
+  .conflict-file-body.open { display: block; }
   .conflict-hint { font-size: 11px; padding: 3px 0; }
   .conflict-cause { font-size: 11px; padding: 2px 0 2px 8px; }
+  .conflict-divergence { font-size: 11px; padding: 2px 0 2px 8px; }
+  .conflict-divergence.ok { color: var(--vscode-charts-green); }
+  .conflict-divergence.warn { color: var(--vscode-charts-orange); }
+  .conflict-hunk { display: flex; gap: 8px; padding: 2px 0 2px 8px; flex-wrap: wrap; }
+  .conflict-hunk-side { flex: 1 1 240px; min-width: 200px; }
+  .conflict-hunk-side .muted { font-size: 10px; }
+  /* Ниже ~420px flex-wrap переносит "входящий коммит" под "main (текущая)" (см. flex-wrap: wrap
+     выше) — main (текущая) и входящий коммит одного и того же места конфликта образуют ОДНУ группу
+     (см. .conflict-hunk), разделять их линией не нужно. Граница нужна МЕЖДУ группами — когда в
+     файле несколько мест конфликта подряд (несколько .conflict-hunk), иначе на узком экране два
+     стека "main/входящий" читаются слитно, непонятно, где кончается один и начинается другой.
+     container-type — на родителе .conflict-file-body (а не на самом .conflict-hunk): элемент не
+     может быть контейнером запроса для самого себя. Порог подобран близко к порогу самого переноса
+     (2*200px min-width + 8px gap ≈ 408px), не обязан совпадать с ним пиксель-в-пиксель. */
+  @container (max-width: 420px) {
+    .conflict-hunk + .conflict-hunk { border-top: 1px dashed var(--qr-card-border); margin-top: 6px; padding-top: 6px; }
+  }
+  .hunk-code { margin: 2px 0 0 0; padding: 4px 0; background: var(--vscode-textCodeBlock-background); border-radius: 3px; font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; max-height: 160px; overflow-y: auto; }
+  /* Номер строки — ::before на data-line, а не текстовый узел: исключён из выделения/копирования
+     сам по себе (user-select:none плюс генерируемый контент никогда не входит в буфер обмена при
+     копировании кода ниже), без единой строчки JS на обработку copy. */
+  .hunk-line { position: relative; padding: 0 6px 0 34px; white-space: pre-wrap; word-break: break-word; }
+  .hunk-line::before { content: attr(data-line); position: absolute; left: 6px; width: 24px; text-align: right; color: var(--vscode-editorLineNumber-foreground, var(--vscode-descriptionForeground)); user-select: none; }
+  .hunk-line.muted { font-style: italic; padding-left: 6px; }
+  .hunk-line.muted::before { content: none; }
   .filter-row { display: flex; gap: 14px; align-items: center; margin-top: 8px; flex-wrap: wrap; font-size: 12px; }
   .limit-field { display: flex; align-items: center; gap: 6px; white-space: nowrap; cursor: default; margin-left: auto; }
   /* Переключатель ("Показать служебные"/"Скрыть уже в main") — обычный чекбокс визуально в виде
@@ -571,6 +609,9 @@ export class ReleasePanel {
   .cherry-sha { display: inline-block; padding: 1px 6px; margin: 1px 3px 1px 0; border-radius: var(--qr-radius-sm); color: #000; text-decoration: none; border: 2px solid transparent; font-size: 11px; cursor: pointer; }
   .cherry-sha:hover { filter: brightness(1.12); text-decoration: underline; }
   .cherry-sha.conflict { background: var(--vscode-charts-red) !important; color: #fff; }
+  /* Тот же приём, что у .cherry-sha.conflict, но для условного конфликта (см. .badge.conditional
+     выше) — жёлтый, а не красный, чтобы отличать "не проверялось" от подтверждённого конфликта. */
+  .cherry-sha.conditional { background: var(--vscode-charts-yellow, #E2C08D) !important; color: #000; }
   /* Состояние "уже скопировано" — блёклый текст, чтобы не запутаться, какую команду уже брали. */
   .cherry-cmd.copied { opacity: 0.45; }
 </style>
@@ -763,6 +804,11 @@ export class ReleasePanel {
   const branchNameByRef = new Map();
   let currentPlan = null;
   let shaToBranch = new Map();
+  // Развёрнутые блоки "наша"/"их" версия конфликта (см. renderConflictDetails) — свёрнуты по
+  // умолчанию, иначе на хронологии с несколькими конфликтующими файлами разом занимало бы весь
+  // экран. Ключ — sha коммита + путь файла, т.к. один и тот же файл может конфликтовать в разных
+  // коммитах хронологии.
+  let expandedConflictSources = new Set();
   let limitInitialized = false;
   // Ключи (sha через запятую) команд из блока "cherry-pick", которые уже скопированы — только
   // чтобы визуально притушить их (см. .cherry-cmd.copied) и не запутаться, что уже брали; сбрасывается
@@ -843,6 +889,14 @@ export class ReleasePanel {
 
   function escapeHtml(s) {
     return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+  }
+
+  // Значок "возможен конфликт" (badge/chip conditional) — та же форма треугольника, что и у
+  // обычного предупреждения (⚠, реальный конфликт), но со знаком вопроса вместо восклицательного —
+  // в шрифтах нет готового юникод-символа "треугольник с вопросом", поэтому рисуем сами: одна и та
+  // же заливка currentColor, чтобы автоматически совпадать с цветом текста бейджа/чипа, где вставлена.
+  function conditionalIcon() {
+    return '<svg width="11" height="11" viewBox="0 0 16 16" style="vertical-align:-1px" aria-hidden="true"><path d="M8 1.3 L15.2 14.3 H0.8 Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><text x="8" y="12.3" text-anchor="middle" font-size="8" font-weight="bold" fill="currentColor">?</text></svg>';
   }
 
   function formatDate(iso) {
@@ -1031,6 +1085,17 @@ export class ReleasePanel {
     \`;
     }).join('') || \`<div class="muted" style="padding:6px 8px;">Ничего не найдено (проверьте фильтр или переключатели выше)</div>\`);
 
+    // #branchList — resize:vertical (см. CSS): ручной resize навсегда фиксирует высоту как
+    // inline-стиль, даже когда контент подстраивается под данные (например, после фильтра осталось
+    // меньше строк) — иначе оставшееся место превращается в пустую область, а скролл вниз уходит в
+    // пустоту (реальная жалоба при использовании). Если контент теперь короче видимой высоты бокса
+    // — подрезаем высоту под контент (не ниже CSS-минимума 120px); если контент ДЛИННЕЕ — не
+    // трогаем: ручной размер и предназначен для управления тем, сколько видно без скролла, и не
+    // должен "прыгать" при каждой перерисовке одного и того же по размеру списка.
+    if (el.clientHeight > 0 && el.scrollHeight < el.clientHeight) {
+      el.style.height = Math.max(el.scrollHeight, 120) + 'px';
+    }
+
     [...el.querySelectorAll('.branch-check')].forEach((cb) => {
       cb.addEventListener('change', (e) => {
         if (e.target.checked) selectedRefs.add(e.target.dataset.ref);
@@ -1084,10 +1149,29 @@ export class ReleasePanel {
     }
     if (typeof ResizeObserver !== 'undefined') {
       let resizeFrame = null;
+      // Пустота внизу после ресайза (реальная жалоба) возникает не только когда МЕНЬШЕ данных
+      // (это уже покрыто проверкой выше, при перерисовке) — ещё и когда меняется ШИРИНА бокса
+      // (пользователь тащит край панели/сайдбара VS Code), из-за чего темы/имена веток
+      // переносятся на другое число строк и scrollHeight меняется САМ ПО СЕБЕ, а зафиксированная
+      // ручным вертикальным resize'ом высота — нет. Подрезаем высоту только когда изменилась
+      // ШИРИНА (не высота) — иначе это ломало бы сам ручной вертикальный resize: пользователь
+      // тащит высоту больше контента специально (чтобы видеть всё без скролла), и это нужно
+      // уважать, а не одёргивать обратно на каждый кадр во время его собственного драга.
+      let lastBranchListWidth = el.clientWidth;
+      let widthChangedSinceLastFrame = false;
       branchRailResizeObserver = new ResizeObserver(() => {
+        const newWidth = el.clientWidth;
+        if (newWidth !== lastBranchListWidth) {
+          widthChangedSinceLastFrame = true;
+          lastBranchListWidth = newWidth;
+        }
         if (resizeFrame !== null) return;
         resizeFrame = requestAnimationFrame(() => {
           resizeFrame = null;
+          if (widthChangedSinceLastFrame && el.clientHeight > 0 && el.scrollHeight < el.clientHeight) {
+            el.style.height = Math.max(el.scrollHeight, 120) + 'px';
+          }
+          widthChangedSinceLastFrame = false;
           drawBranchRailNow();
         });
       });
@@ -1500,11 +1584,23 @@ export class ReleasePanel {
     }
   }
 
-  // Реальный источник dry-run конфликта на файл — не догадка по пересечению файлов, а фактический
-  // "кто последним менял этот файл" в состоянии worktree непосредственно перед конфликтом (main +
-  // всё, что уже успешно применилось раньше в этом прогоне), см. GitService.lastCommitTouchingFile
-  // и performDryRun. Если этот sha совпадает с одним из показанных коммитов хронологии — подписываем
-  // веткой (shaToBranch), иначе это содержимое уже основной ветки.
+  // Реальный источник dry-run конфликта на файл — не догадка по пересечению файлов и не "последний
+  // коммит, менявший файл вообще", а git blame по КОНКРЕТНЫМ строкам, которые не сошлись (см.
+  // GitService.analyzeConflictSource/performDryRun) — тот, кто реально в ответе за содержимое,
+  // из-за которого конфликт. Если этот sha совпадает с одним из показанных коммитов хронологии —
+  // подписываем веткой (shaToBranch), иначе это содержимое уже основной ветки.
+  //
+  // renderConflictHunks (см. types.ts ConflictHunk) — сырое "наша"/"их" содержимое места конфликта,
+  // прямо из маркеров конфликта (<<<<<<< / ======= / >>>>>>>), без единого доп. git-вызова.
+  // sameContent — обе стороны совпадают с точностью до пробелов/пустых строк: конфликт не из-за
+  // содержимого, а из-за контекста слияния, любую сторону можно принять не разбираясь в смысле.
+  //
+  // taskDivergence (см. types.ts) — если у найденного коммита есть ключ задачи в subject и на dev
+  // нашёлся коммит с тем же ключом, но другим sha: типичный случай — когда-то при подготовке
+  // релиза здесь уже был конфликт, и вместо мержа его решили отдельным коммитом, а не забытая
+  // ветка и не случайное пересечение правок. contentMatch показывает, сошлось ли содержимое —
+  // 'identical'/'near-identical' успокаивают (можно принять любую сторону), 'different' — честно
+  // предупреждает, что поведение может отличаться.
   //
   // Дальше — подсказка, что делать: если сам конфликтующий коммит уже отмечен как "уже в main"
   // (badge alreadyInMain), самое простое решение — исключить его из релиза, а не разрешать
@@ -1512,6 +1608,71 @@ export class ReleasePanel {
   // в planner.ts) — коммиты с других, ещё не выбранных веток, тоже трогающие конфликтующий файл и
   // ещё не выпущенные: вероятная настоящая причина — забытая задача, а не противоречащие правки.
   // Если и там пусто — честно говорим, что причину найти не удалось и конфликт придётся разрешать вручную.
+  // Сырое место конфликта (см. ConflictHunk в types.ts) — что реально стоит "нашей" стороной (main/
+  // текущая) и что несёт входящий коммит в этих же строках, прямо из маркеров конфликта, без
+  // единого дополнительного git-вызова. sameContent — после нормализации пробелов/пустых строк обе
+  // стороны совпадают: конфликт не из-за содержимого, а из-за контекста 3-way merge — можно
+  // спокойно принять любую сторону, не разбираясь в смысле правки.
+  // Каждая строка — отдельный .hunk-line с data-line, номер рисуется через CSS ::before (см. CSS
+  // выше) — не текстовый узел, поэтому никогда не попадает под копирование самого кода строкой ниже.
+  function renderHunkCode(textLines, startLine, emptyLabel) {
+    if (textLines.length === 0) {
+      return \`<div class="hunk-code"><div class="hunk-line muted">\${emptyLabel}</div></div>\`;
+    }
+    const rows = textLines.map((line, idx) => {
+      const lineNo = startLine !== null ? startLine + idx : null;
+      const attr = lineNo !== null ? \` data-line="\${lineNo}"\` : '';
+      return \`<div class="hunk-line"\${attr}>\${escapeHtml(line)}</div>\`;
+    }).join('');
+    return \`<div class="hunk-code">\${rows}</div>\`;
+  }
+
+  function renderConflictHunks(hunks) {
+    if (!hunks || hunks.length === 0) return '';
+    return hunks.map((h) => {
+      const oursCode = renderHunkCode(h.oursText, h.oursStartLine, '(пусто — main тут ничего не меняет)');
+      const theirsCode = renderHunkCode(h.theirsText, h.theirsStartLine, '(пусто — входящий коммит удаляет это место)');
+      const sameNote = h.sameContent
+        ? '<div class="conflict-divergence ok">✓ Различий по сути нет (пробелы/пустые строки не в счёт) — конфликт из-за контекста слияния, а не содержимого. Можно принять любую сторону.</div>'
+        : '';
+      return \`<div class="conflict-hunk">
+        <div class="conflict-hunk-side"><span class="muted">main (текущая)\${h.oursStartLine !== null ? ', строка ' + h.oursStartLine : ''}:</span>\${oursCode}</div>
+        <div class="conflict-hunk-side"><span class="muted">входящий коммит\${h.theirsStartLine !== null ? ', строка ' + h.theirsStartLine : ''}:</span>\${theirsCode}</div>
+      </div>\` + sameNote;
+    }).join('');
+  }
+
+  function renderTaskDivergence(d) {
+    if (!d) return '';
+    const link = d.otherCommitUrl
+      ? \`<a href="\${d.otherCommitUrl}" target="_blank" rel="noopener">\${d.otherSha.slice(0,8)}</a>\`
+      : d.otherSha.slice(0,8);
+    const otherInfo = \`\${link} «\${escapeHtml(d.otherSubject)}» · \${escapeHtml(d.otherAuthorName)} · \${formatDate(d.otherAuthorDate)}\`;
+    if (d.contentMatch === 'different') {
+      return \`<div class="conflict-divergence warn">⚠ Задача \${escapeHtml(d.taskKey)} также реализована на dev отдельным коммитом (\${otherInfo}), но содержимое отличается — возможно, разное поведение, разрешайте вручную.</div>\`;
+    }
+    const matchNote = d.contentMatch === 'identical' ? 'содержимое совпадает' : 'содержимое отличается только пробелами/пустыми строками';
+    return \`<div class="conflict-divergence ok">✓ Похоже, задача \${escapeHtml(d.taskKey)} уже реализована на dev отдельным коммитом (\${otherInfo}) — \${matchNote}, историю просто разъединил прошлый релиз. Можно принять любую сторону при разрешении.</div>\`;
+  }
+
+  // Текст заголовка одного конфликтующего файла — отдельно от разметки, чтобы не плодить тройной
+  // вложенный тернарник прямо в шаблоне ниже.
+  function renderConflictFileHeaderText(s) {
+    if (!s.sha) {
+      return 'файла нет в истории основной ветки (вероятно, его создаёт сам этот коммит)';
+    }
+    const branch = shaToBranch.get(s.sha);
+    const who = branch ? \`ветка <b>\${escapeHtml(branch)}</b>\` : 'уже в основной ветке';
+    const link = s.commitUrl
+      ? \`<a href="\${s.commitUrl}" target="_blank" rel="noopener">\${s.sha.slice(0,8)}</a>\`
+      : s.sha.slice(0,8);
+    return \`конфликтующие строки последним менял: \${who}, \${link}\${s.subject ? ' «' + escapeHtml(s.subject) + '»' : ''}\${s.authorName ? ' · ' + escapeHtml(s.authorName) : ''}\${s.authorDate ? ' · ' + formatDate(s.authorDate) : ''}\`;
+  }
+
+  // Один файл — один сворачиваемый блок (клик по пути файла): на хронологии с несколькими
+  // конфликтующими файлами разом текст различий иначе занимал бы весь экран. Ключ разворота —
+  // sha коммита + путь файла (см. expandedConflictSources), состояние переживает перерисовку,
+  // но не переживает смену проекта (сбрасывается в 'resetForNewContext').
   function renderConflictDetails(item) {
     const sources = item.dryRunConflictSources || [];
     let details = '';
@@ -1521,15 +1682,13 @@ export class ReleasePanel {
         : '';
     } else {
       details = '<div class="conflict-details">' + sources.map((s) => {
-        if (!s.sha) {
-          return \`<div class="conflict-file"><b>\${s.file}</b> — файла нет в истории основной ветки (вероятно, его создаёт сам этот коммит)</div>\`;
-        }
-        const branch = shaToBranch.get(s.sha);
-        const who = branch ? \`ветка <b>\${branch}</b>\` : 'уже в основной ветке';
-        const link = s.commitUrl
-          ? \`<a href="\${s.commitUrl}" target="_blank" rel="noopener">\${s.sha.slice(0,8)}</a>\`
-          : s.sha.slice(0,8);
-        return \`<div class="conflict-file"><b>\${s.file}</b> — последним менял: \${who}, \${link}\${s.subject ? ' «' + s.subject + '»' : ''}\${s.authorName ? ' · ' + s.authorName : ''}\${s.authorDate ? ' · ' + formatDate(s.authorDate) : ''}</div>\`;
+        const key = item.sha + '|' + s.file;
+        const isOpen = expandedConflictSources.has(key);
+        const bodyHtml = renderConflictHunks(s.hunks) + (s.sha ? renderTaskDivergence(s.taskDivergence) : '');
+        return \`<div class="conflict-file-block">
+          <div class="conflict-file"><span class="conflict-file-toggle" data-key="\${escapeHtml(key)}"><span class="conflict-file-arrow">\${isOpen ? '▾' : '▸'}</span> <b>\${escapeHtml(s.file)}</b></span> — \${renderConflictFileHeaderText(s)}</div>
+          <div class="conflict-file-body\${isOpen ? ' open' : ''}" data-key="\${escapeHtml(key)}">\${bodyHtml}</div>
+        </div>\`;
       }).join('') + '</div>';
     }
 
@@ -1555,6 +1714,34 @@ export class ReleasePanel {
     return details + hint;
   }
 
+  // Для 'conditional' (см. DryRunStatus в types.ts) ядро возвращает только пересекающиеся файлы
+  // (dryRunConflictFiles) — само расширение (performDryRun не хранит ссылку на плохой sha, только
+  // множество файлов) ссылку на "виновный" конфликт не прокидывает. Ищем сами: самый ранний по
+  // хронологии предыдущий item с dryRunStatus === 'conflict', который трогает хотя бы один из тех
+  // же файлов — этого достаточно для объяснения пользователю, разбираться среди НЕСКОЛЬКИХ
+  // конфликтов не нужно (currentPlan.items уже отсортирован по authorDate, как и everywhere иначе).
+  function findBlockingConflictItems(item) {
+    if (!currentPlan) return [];
+    const files = new Set(item.dryRunConflictFiles || []);
+    const blockers = [];
+    for (const other of currentPlan.items) {
+      if (other === item) break;
+      if (other.dryRunStatus === 'conflict' && (other.files || []).some((f) => files.has(f))) {
+        blockers.push(other);
+      }
+    }
+    return blockers;
+  }
+
+  function renderConditionalDetails(item) {
+    const files = (item.dryRunConflictFiles || []).map(escapeHtml).join(', ');
+    const blockers = findBlockingConflictItems(item);
+    const blockersText = blockers.length
+      ? blockers.map((b) => (b.commitUrl ? \`<a href="\${b.commitUrl}" target="_blank" rel="noopener">\${b.sha.slice(0,8)}</a>\` : b.sha.slice(0,8))).join(', ')
+      : null;
+    return \`<div class="conditional-details">Не проверено — зависит от конфликта\${blockersText ? ' ' + blockersText : ''} по \${files}.</div>\`;
+  }
+
   // Суммаризация под таблицей хронологии — только отмеченные чекбоксом (included) коммиты выбранных
   // веток; контекстные/якорные коммиты dev в счёт не идут (их и не может быть в currentPlan.items —
   // они собираются отдельно, см. renderContextRow/renderAnchorRow). Пересчитывается и при полном
@@ -1570,6 +1757,7 @@ export class ReleasePanel {
     const files = new Set();
     included.forEach((i) => (i.files || []).forEach((f) => files.add(f)));
     const conflicts = included.filter((i) => i.dryRunStatus === 'conflict').length;
+    const conditional = included.filter((i) => i.dryRunStatus === 'conditional').length;
     const sep = '<span class="chrono-summary-sep">·</span>';
     const stats = [
       \`\${included.length} коммит(ов)\`,
@@ -1579,6 +1767,7 @@ export class ReleasePanel {
       \`\${files.size} файлов\`,
     ];
     if (conflicts > 0) stats.push(\`<span class="badge conflict">⚠ \${conflicts} конфликт(ов)</span>\`);
+    if (conditional > 0) stats.push(\`<span class="badge conditional">\${conditionalIcon()} \${conditional} возможных</span>\`);
     return stats.join(sep);
   }
 
@@ -1587,9 +1776,10 @@ export class ReleasePanel {
   function renderConflictSummaryTop(items) {
     if (!items || items.length === 0) return '';
     const conflicts = items.filter((i) => i.included && i.dryRunStatus === 'conflict').length;
-    return conflicts > 0
-      ? \`<span class="conflict-summary-top bad">Конфликты: \${conflicts} ⚠</span>\`
-      : \`<span class="conflict-summary-top ok">Конфликты: 0 ✓</span>\`;
+    const conditional = items.filter((i) => i.included && i.dryRunStatus === 'conditional').length;
+    if (conflicts === 0 && conditional === 0) return '<span class="conflict-summary-top ok">Конфликты: 0 ✓</span>';
+    const conditionalText = conditional > 0 ? \` <span class="conflict-summary-top conditional">\${conditionalIcon()} \${conditional} возможных</span>\` : '';
+    return \`<span class="conflict-summary-top bad">Конфликты: \${conflicts} ⚠</span>\${conditionalText}\`;
   }
 
   function updateChronologySummary() {
@@ -1607,6 +1797,9 @@ export class ReleasePanel {
     else if (item.dryRunStatus === 'conflict') {
       dryRunBadge = \`<span class="badge conflict">⚠ конфликт (\${item.dryRunConflictFiles.length} файл(ов))</span>\`;
       conflictDetails = renderConflictDetails(item);
+    } else if (item.dryRunStatus === 'conditional') {
+      dryRunBadge = \`<span class="badge conditional">\${conditionalIcon()} возможен конфликт (\${item.dryRunConflictFiles.length} файл(ов))</span>\`;
+      conflictDetails = renderConditionalDetails(item);
     }
     const appliedBadge = item.applied ? '<span class="badge applied">применён</span>' : '';
     let overlapBadge = '';
@@ -2137,6 +2330,24 @@ export class ReleasePanel {
       });
     });
 
+    [...el.querySelectorAll('.conflict-file-toggle')].forEach((toggle) => {
+      toggle.addEventListener('click', () => {
+        const key = toggle.dataset.key;
+        const body = [...el.querySelectorAll('.conflict-file-body')].find((b) => b.dataset.key === key);
+        if (!body) return;
+        const arrow = toggle.querySelector('.conflict-file-arrow');
+        if (expandedConflictSources.has(key)) {
+          expandedConflictSources.delete(key);
+          body.classList.remove('open');
+          if (arrow) arrow.textContent = '▸';
+        } else {
+          expandedConflictSources.add(key);
+          body.classList.add('open');
+          if (arrow) arrow.textContent = '▾';
+        }
+      });
+    });
+
     renderCherryPickCommands();
     updateChronologySummary();
   }
@@ -2146,11 +2357,14 @@ export class ReleasePanel {
     // ПОСЛЕДНИЙ элемент (примените её, разрешите конфликт в редакторе), следующая команда начинается
     // со следующего коммита — так после разрешения конфликта понятно, какую команду брать дальше,
     // вместо одной команды на всю хронологию, которая молча остановится где-то посередине.
+    // 'conditional' (см. DryRunStatus в types.ts) режем точно так же — его вообще не проверяли
+    // реальным cherry-pick (см. performDryRun), поэтому лучше явно выделить его в СВОЮ команду, а не
+    // молча смешивать с соседними, чей исход подтверждён.
     const segments = [];
     let current = [];
     for (const item of items) {
       current.push(item);
-      if (item.dryRunStatus === 'conflict') {
+      if (item.dryRunStatus === 'conflict' || item.dryRunStatus === 'conditional') {
         segments.push(current);
         current = [];
       }
@@ -2184,14 +2398,20 @@ export class ReleasePanel {
       .map((segment, idx) => {
         const key = cherryCmdKey(segment);
         const copied = copiedCherryCmdKeys.has(key);
-        const endsInConflict = segment[segment.length - 1].dryRunStatus === 'conflict';
+        const lastStatus = segment[segment.length - 1].dryRunStatus;
+        const endsNote = lastStatus === 'conflict'
+          ? ' — заканчивается конфликтом'
+          : lastStatus === 'conditional'
+            ? ' — заканчивается непроверенным коммитом (возможен конфликт)'
+            : '';
         const label = segments.length > 1 ? \`Команда \${idx + 1} из \${segments.length}\` : 'Команда';
         const tokens = segment
           .map((item) => {
             const color = colorFor(item.branch);
             const isConflict = item.dryRunStatus === 'conflict';
-            const cls = isConflict ? 'cherry-sha conflict' : 'cherry-sha';
-            const style = isConflict ? \`border-color:\${color}\` : \`background:\${color}\`;
+            const isConditional = item.dryRunStatus === 'conditional';
+            const cls = isConflict ? 'cherry-sha conflict' : isConditional ? 'cherry-sha conditional' : 'cherry-sha';
+            const style = isConflict || isConditional ? \`border-color:\${color}\` : \`background:\${color}\`;
             const shaLabel = item.sha.slice(0, 8);
             const title = escapeHtml(item.branch);
             return item.commitUrl
@@ -2206,7 +2426,7 @@ export class ReleasePanel {
         return \`
           <div class="cherry-cmd \${copied ? 'copied' : ''}">
             <div class="cherry-cmd-header">
-              <span class="cherry-cmd-label">\${label}\${endsInConflict ? ' — заканчивается конфликтом' : ''}</span>
+              <span class="cherry-cmd-label">\${label}\${endsNote}</span>
               <button class="secondary cherry-copy-btn" data-cmd="\${escapeHtml(plainCmd)}" data-key="\${escapeHtml(key)}">Копировать</button>
             </div>
             <div class="cherry-cmd-body"><span class="cherry-cmd-prefix">git cherry-pick</span> \${tokens}</div>
@@ -2264,6 +2484,7 @@ export class ReleasePanel {
       // те же имена/refs вполне могут существовать (например, одноимённая задача), и без сброса под
       // ними оказались бы данные ЧУЖОГО репозитория (коммиты, статус "в main", даже цвет дорожки).
       expandedRefs = new Set();
+      expandedConflictSources = new Set();
       branchCommitsCache.clear();
       branchNameByRef.clear();
       branchMainStatusOverride.clear();

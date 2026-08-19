@@ -1301,12 +1301,16 @@ export class ReleaseSession implements ReleasePanelHost {
    * после построения/изменения хронологии (см. комментарий там), поэтому здесь только мутирует
    * this.plan.items — persist/postPlan и обработку ошибок делает вызывающий код.
    *
-   * Если dry-run остановился на настоящем конфликте (не на уже-в-main коммите — для него достаточно
-   * подсказки "можно исключить из релиза", основанной на существующем item.alreadyInMain), для
-   * каждого конфликтующего файла ищем вероятную причину — см. findConflictCauses: коммиты с других,
-   * ещё не выбранных веток, которые тоже трогают этот файл и ещё не в main. Дёшево (по одному
-   * git-вызову на конфликтующий файл, а их обычно один-два — dry-run останавливается на первом
-   * же конфликте), поэтому можно позволить себе всегда, а не только по отдельной кнопке.
+   * Для КАЖДОГО настоящего конфликта (dryRunStatus === 'conflict', не уже-в-main коммита — для него
+   * достаточно подсказки "можно исключить из релиза", основанной на существующем item.alreadyInMain)
+   * ищем вероятную причину — см. findConflictCauses: коммиты с других, ещё не выбранных веток, которые
+   * тоже трогают этот файл и ещё не в main. performDryRun больше не останавливается на первом же
+   * конфликте (см. dryRun.ts) — он продолжает через ВЕСЬ список, пропуская (без реального
+   * cherry-pick, статус 'conditional') коммиты, которые трогают файлы уже найденного, но пока не
+   * разрешённого конфликта: их итог зависит от того, как вы его разрешите, и гадать за пользователя
+   * нельзя. Поэтому конфликтов теперь может быть несколько за один прогон — дёшево (по одному
+   * git-вызову на конфликтующий файл), поэтому можно позволить себе для каждого, а не только для
+   * первого найденного.
    */
   private async runDryRunOnCurrentPlan(): Promise<void> {
     if (!this.plan || this.plan.items.length === 0) return;
@@ -1317,7 +1321,8 @@ export class ReleaseSession implements ReleasePanelHost {
     // конфликта на самом деле не вызовет (см. performDryRun).
     const baseRef =
       this.releaseBranch && (await this.git.branchExists(this.releaseBranch)) ? this.releaseBranch : this.plan.mainBranch;
-    const outcome = await performDryRun(this.git, baseRef, this.plan.items);
+    const devRef = await this.resolveDevRef();
+    const outcome = await performDryRun(this.git, baseRef, devRef, this.plan.items);
 
     const bySha = new Map(outcome.results.map((r) => [r.sha, r] as const));
     for (const item of this.plan.items) {
@@ -1328,15 +1333,21 @@ export class ReleaseSession implements ReleasePanelHost {
         item.dryRunConflictSources = result.conflictSources.map((source) => ({
           ...source,
           commitUrl: source.sha ? this.buildLinks('', source.subject ?? '', source.sha, null).commitUrl : null,
+          taskDivergence: source.taskDivergence
+            ? {
+                ...source.taskDivergence,
+                otherCommitUrl: this.buildLinks('', source.taskDivergence.otherSubject, source.taskDivergence.otherSha, null).commitUrl,
+              }
+            : null,
         }));
       } else if (item.included) {
         item.dryRunStatus = 'untested';
       }
     }
 
-    const conflictItem = this.plan.items.find((i) => i.dryRunStatus === 'conflict');
-    if (conflictItem && !conflictItem.alreadyInMain) {
-      const excludeShas = new Set(this.plan.items.map((i) => i.sha));
+    const excludeShas = new Set(this.plan.items.map((i) => i.sha));
+    for (const conflictItem of this.plan.items) {
+      if (conflictItem.dryRunStatus !== 'conflict' || conflictItem.alreadyInMain) continue;
       for (const source of conflictItem.dryRunConflictSources) {
         const causes = await findConflictCauses(
           this.git,
