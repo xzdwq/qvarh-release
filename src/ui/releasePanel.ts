@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { BranchCommitInfo, BranchDiffStat, BranchRef, MainStatus, ReleasePlan, StaleBranchHint } from '../core/types';
+import { BranchCommitInfo, BranchDiffStat, BranchRef, ConflictSource, MainStatus, ReleasePlan, StaleBranchHint } from '../core/types';
 import { ExecutorEvent } from '../core/executor';
 import { setActiveProjectId } from '../activeProject';
 
@@ -72,6 +72,15 @@ export class ReleasePanel {
       ReleasePanel.current.host = host;
       ReleasePanel.current.currentProjectId = context?.projectId;
       setActiveProjectId(context?.projectId);
+      // Панель переиспользуется без перезагрузки страницы (см. комментарий выше) — дата релиза,
+      // посчитанная в JS один раз при первом создании панели, иначе оставалась бы датой ТОГО дня
+      // при каждом повторном открытии (реальная жалоба: открыли вчера — дата "вчерашняя" и сегодня).
+      // Шлём независимо от того, переключился проект или нет — "каждое открытие" шире, чем условие
+      // ниже у resetForNewContext.
+      ReleasePanel.current.panel.webview.postMessage({
+        command: 'refreshReleaseDate',
+        today: new Date().toISOString().slice(0, 10),
+      });
       if (switched) {
         ReleasePanel.current.panel.webview.postMessage({ command: 'resetForNewContext' });
       }
@@ -174,8 +183,22 @@ export class ReleasePanel {
     );
   }
 
-  postCurrentBranch(current: string, mainBranch: string, devBranch: string, staleBranchesLookbackReleases: number): void {
-    this.panel.webview.postMessage({ command: 'currentBranch', current, mainBranch, devBranch, staleBranchesLookbackReleases });
+  postCurrentBranch(
+    current: string,
+    mainBranch: string,
+    devBranch: string,
+    staleBranchesLookbackReleases: number,
+    dirtyState: { hasStaged: boolean; hasUnstaged: boolean }
+  ): void {
+    this.panel.webview.postMessage({
+      command: 'currentBranch',
+      current,
+      mainBranch,
+      devBranch,
+      staleBranchesLookbackReleases,
+      hasStaged: dirtyState.hasStaged,
+      hasUnstaged: dirtyState.hasUnstaged,
+    });
   }
 
   /**
@@ -233,6 +256,17 @@ export class ReleasePanel {
 
   postPlan(plan: ReleasePlan | null): void {
     this.panel.webview.postMessage({ command: 'planBuilt', plan });
+  }
+
+  /**
+   * Досчитанное фоном объяснение причины конфликта (git blame/taskDivergence/possibleCauses) —
+   * см. session.ts runBackgroundConflictAnalysis. Сама хронология (postPlan выше) уже показана
+   * быстро, с заглушками (ConflictSource.analysisPending === true, см. types.ts) — это сообщение
+   * заменяет их на настоящие данные, когда фон досчитает; клиент сам решает, перерисовывать ли
+   * (и снимать лоадер), не трогая persist/структуру плана целиком.
+   */
+  postConflictAnalysisUpdate(updates: Array<{ sha: string; conflictSources: ConflictSource[] }>): void {
+    this.panel.webview.postMessage({ command: 'conflictAnalysisUpdate', updates });
   }
 
   /**
@@ -364,7 +398,7 @@ export class ReleasePanel {
      не наезжают на неё. */
   .search-field { position: relative; display: flex; align-items: center; }
   .search-field .search-icon { position: absolute; left: 8px; width: 14px; height: 14px; opacity: 0.6; pointer-events: none; color: var(--vscode-input-foreground); }
-  .search-field input[type=text] { padding-left: 28px; max-width: 420px; }
+  .search-field input[type=text] { padding-left: 28px; max-width: 600px; }
   input[type=text], input[type=number], select { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: var(--qr-radius-sm); padding: 4px 6px; font-family: inherit; font-size: inherit; }
   input[type=text] { width: 100%; max-width: 260px; }
   select { cursor: pointer; }
@@ -603,15 +637,15 @@ export class ReleasePanel {
   .cherry-cmd-label { font-size: 11px; opacity: 0.75; }
   .cherry-cmd-body { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; line-height: 2; word-break: break-word; }
   .cherry-cmd-prefix { opacity: 0.8; margin-right: 4px; }
-  /* Каждый sha — цветной "чип", как .lane-label в хронологии: тот же colorFor(branch), чтобы
-     совпадало визуально. У конфликтного — фон красный (как .badge.conflict), а обводка — в цвет
-     ветки, чтобы не терять связь с веткой даже когда фон перекрыт цветом конфликта. */
+  /* Каждый sha — цветной "чип", как .lane-label в хронологии: тот же colorFor(branch) — фон ВСЕГДА
+     цвет ветки (не теряем связь с веткой даже у конфликтного коммита), а обводка — красная/жёлтая
+     у конфликтного/условного, чтобы предупреждение было заметно, но не перекрывало цвет ветки. */
   .cherry-sha { display: inline-block; padding: 1px 6px; margin: 1px 3px 1px 0; border-radius: var(--qr-radius-sm); color: #000; text-decoration: none; border: 2px solid transparent; font-size: 11px; cursor: pointer; }
   .cherry-sha:hover { filter: brightness(1.12); text-decoration: underline; }
-  .cherry-sha.conflict { background: var(--vscode-charts-red) !important; color: #fff; }
+  .cherry-sha.conflict { border-color: var(--vscode-charts-red) !important; }
   /* Тот же приём, что у .cherry-sha.conflict, но для условного конфликта (см. .badge.conditional
-     выше) — жёлтый, а не красный, чтобы отличать "не проверялось" от подтверждённого конфликта. */
-  .cherry-sha.conditional { background: var(--vscode-charts-yellow, #E2C08D) !important; color: #000; }
+     выше) — жёлтая обводка, а не красная, чтобы отличать "не проверялось" от подтверждённого конфликта. */
+  .cherry-sha.conditional { border-color: var(--vscode-charts-yellow, #E2C08D) !important; }
   /* Состояние "уже скопировано" — блёклый текст, чтобы не запутаться, какую команду уже брали. */
   .cherry-cmd.copied { opacity: 0.45; }
 </style>
@@ -657,15 +691,13 @@ export class ReleasePanel {
       </div>
     </div>
     <div class="collapsible-body" id="branchesBody">
-    <div class="field">
+    <div class="filter-row">
       <div class="search-field">
         <svg class="search-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.5" cy="6.5" r="4.5" stroke="currentColor" stroke-width="1.4" fill="none"/><line x1="10" y1="10" x2="14" y2="14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-        <input type="text" id="branchFilter" placeholder="Фильтр по названию ветки, через пробел — несколько сразу" />
+        <input type="text" id="branchFilter" placeholder="фильтр по названию" />
       </div>
-    </div>
-    <div class="filter-row">
       <label class="switch" title="Скрывает ветки, уже полностью выпущенные — проверка идёт git-запросом, поэтому реагирует не мгновенно">
-        <input type="checkbox" id="hideInMainFilter" /><span class="track"></span> Скрыть уже в <span id="hideInMainFilterBranchName">main</span>
+        <input type="checkbox" id="hideInMainFilter" /><span class="track"></span> <span>Скрыть уже в <span id="hideInMainFilterBranchName">main</span></span>
       </label>
       <label class="switch" title="qa, revert-pr-, chore/ и т.п. — см. настройку «Префиксы служебных веток»; по умолчанию скрыты">
         <input type="checkbox" id="hideServiceBranchesFilter" /><span class="track"></span> Показать служебные
@@ -767,6 +799,9 @@ export class ReleasePanel {
     <div class="field field-row">
       <label>Дата релиза (для имени релизной ветки):</label>
       <input type="text" id="releaseDate" />
+      <button id="resetReleaseDateBtn" class="icon-btn" title="Сбросить на сегодняшнюю дату">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 3v3.5h-3.5M3 13v-3.5h3.5" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M3.5 8a4.5 4.5 0 0 1 7.6-3.2l1.9 1.7M12.5 8a4.5 4.5 0 0 1-7.6 3.2l-1.9-1.7" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
     </div>
     <div class="button-row">
       <button id="createBranchBtn" class="btn-blue">Создать релизную ветку</button>
@@ -937,6 +972,10 @@ export class ReleasePanel {
     releaseDateCheckDebounce = setTimeout(requestReleaseDateCheck, 200);
   });
   requestReleaseDateCheck();
+  document.getElementById('resetReleaseDateBtn').addEventListener('click', () => {
+    document.getElementById('releaseDate').value = todayIso();
+    requestReleaseDateCheck();
+  });
 
   function deselectBranch(ref) {
     selectedRefs.delete(ref);
@@ -1085,17 +1124,6 @@ export class ReleasePanel {
     \`;
     }).join('') || \`<div class="muted" style="padding:6px 8px;">Ничего не найдено (проверьте фильтр или переключатели выше)</div>\`);
 
-    // #branchList — resize:vertical (см. CSS): ручной resize навсегда фиксирует высоту как
-    // inline-стиль, даже когда контент подстраивается под данные (например, после фильтра осталось
-    // меньше строк) — иначе оставшееся место превращается в пустую область, а скролл вниз уходит в
-    // пустоту (реальная жалоба при использовании). Если контент теперь короче видимой высоты бокса
-    // — подрезаем высоту под контент (не ниже CSS-минимума 120px); если контент ДЛИННЕЕ — не
-    // трогаем: ручной размер и предназначен для управления тем, сколько видно без скролла, и не
-    // должен "прыгать" при каждой перерисовке одного и того же по размеру списка.
-    if (el.clientHeight > 0 && el.scrollHeight < el.clientHeight) {
-      el.style.height = Math.max(el.scrollHeight, 120) + 'px';
-    }
-
     [...el.querySelectorAll('.branch-check')].forEach((cb) => {
       cb.addEventListener('change', (e) => {
         if (e.target.checked) selectedRefs.add(e.target.dataset.ref);
@@ -1130,7 +1158,19 @@ export class ReleasePanel {
     // офсетам реально отрендеренных строк, а не подгонка под фиксированную высоту — перенос текста
     // темы/имени ветки на несколько строк не ломает линию. #branchList сам скроллится и сам же
     // position:relative — оверлей — просто первый ребёнок, а не отдельный внешний контейнер.
-    const drawBranchRailNow = () => {
+    // allowShrink — см. ResizeObserver ниже: подрезаем инлайновую высоту #branchList под РЕАЛЬНУЮ
+    // высоту строк (не el.scrollHeight — см. ниже, почему) только когда это не может быть в
+    // середине ручного вертикального драга (там это ломало бы сам драг, см. комментарий у
+    // ResizeObserver). Считаем containerHeight по фактической позиции ПОСЛЕДНЕЙ строки, а НЕ по
+    // el.scrollHeight — оверлей рельсы (.branch-rail-overlay) абсолютно позиционирован ВНУТРИ
+    // #branchList (containing block — сам #branchList, у него position:relative), а значит его
+    // собственная высота тоже входит в scrollHeight контейнера. Раньше это создавало
+    // самоподдерживающийся цикл: выставили оверлею высоту H1 → на следующий проход (например,
+    // после document.fonts.ready, когда реальный шрифт "сжал" список до истинной высоты H2 < H1)
+    // el.scrollHeight читался ЕЩЁ раздутым прежним H1 (потому что оверлей физически занимал
+    // столько места), контейнер так и оставался высотой H1 — отсюда пустота внизу без единого
+    // ресайза (подтверждено реальным использованием, дважды "исправлено" неправильно до этого).
+    const drawBranchRailNow = (allowShrink) => {
       if (myGeneration !== branchRailRenderGeneration) return;
       const rowEls = [...el.querySelectorAll('.branch-row')];
       if (rowEls.length === 0) return;
@@ -1138,25 +1178,34 @@ export class ReleasePanel {
       const branchNames = currentBranches.map((b) => b.name);
       const overlay = document.getElementById('branchRailOverlay');
       if (!overlay) return;
-      const containerHeight = el.scrollHeight;
+      const lastRow = rowEls[rowEls.length - 1];
+      const containerHeight = lastRow.offsetTop + lastRow.offsetHeight;
       overlay.style.width = '22px';
       overlay.style.height = containerHeight + 'px';
       overlay.innerHTML = \`<svg width="22" height="\${containerHeight}" style="overflow:visible">\${drawBranchRail(branchNames, rowCenters)}</svg>\`;
+      // #branchList — resize:vertical (см. CSS): ручной resize навсегда фиксирует высоту как
+      // инлайн-стиль, даже когда контент подстраивается под данные (после фильтра осталось меньше
+      // строк, или после document.fonts.ready строки стали компактнее) — иначе оставшееся место
+      // превращается в пустую область, а скролл вниз уходит в пустоту (реальная жалоба). Если
+      // контент теперь короче видимой высоты бокса — подрезаем (не ниже CSS-минимума 120px); если
+      // длиннее — не трогаем: ручной размер для того и нужен, чтобы видеть больше без скролла.
+      if (allowShrink && el.clientHeight > 0 && containerHeight < el.clientHeight) {
+        el.style.height = Math.max(containerHeight, 120) + 'px';
+      }
     };
-    drawBranchRailNow();
+    drawBranchRailNow(true);
     if (document.fonts && document.fonts.ready) {
-      document.fonts.ready.then(drawBranchRailNow);
+      document.fonts.ready.then(() => drawBranchRailNow(true));
     }
     if (typeof ResizeObserver !== 'undefined') {
       let resizeFrame = null;
-      // Пустота внизу после ресайза (реальная жалоба) возникает не только когда МЕНЬШЕ данных
-      // (это уже покрыто проверкой выше, при перерисовке) — ещё и когда меняется ШИРИНА бокса
-      // (пользователь тащит край панели/сайдбара VS Code), из-за чего темы/имена веток
-      // переносятся на другое число строк и scrollHeight меняется САМ ПО СЕБЕ, а зафиксированная
-      // ручным вертикальным resize'ом высота — нет. Подрезаем высоту только когда изменилась
-      // ШИРИНА (не высота) — иначе это ломало бы сам ручной вертикальный resize: пользователь
-      // тащит высоту больше контента специально (чтобы видеть всё без скролла), и это нужно
-      // уважать, а не одёргивать обратно на каждый кадр во время его собственного драга.
+      // Пустота внизу после ресайза возникает не только когда МЕНЬШЕ данных (уже покрыто выше) —
+      // ещё и когда меняется ШИРИНА бокса (пользователь тащит край панели/сайдбара VS Code), из-за
+      // чего темы/имена веток переносятся на другое число строк, а зафиксированная ручным
+      // вертикальным resize'ом высота — нет. Подрезаем только когда изменилась ШИРИНА (не высота)
+      // — иначе это ломало бы сам ручной вертикальный resize: пользователь тащит высоту больше
+      // контента специально (чтобы видеть всё без скролла), и это нужно уважать, а не одёргивать
+      // обратно на каждый кадр во время его собственного драга.
       let lastBranchListWidth = el.clientWidth;
       let widthChangedSinceLastFrame = false;
       branchRailResizeObserver = new ResizeObserver(() => {
@@ -1168,11 +1217,15 @@ export class ReleasePanel {
         if (resizeFrame !== null) return;
         resizeFrame = requestAnimationFrame(() => {
           resizeFrame = null;
-          if (widthChangedSinceLastFrame && el.clientHeight > 0 && el.scrollHeight < el.clientHeight) {
-            el.style.height = Math.max(el.scrollHeight, 120) + 'px';
-          }
+          // Без этой проверки: disconnect() выше останавливает будущие срабатывания старого
+          // наблюдателя, но НЕ отменяет rAF, который он уже успел поставить в очередь — фоновые
+          // сообщения (branchMainStatus/branchDiffStats/branchCommits, см. обработчики ниже) зовут
+          // renderBranches() волнами, одно за другим, и "устаревший" кадр от предыдущего рендера
+          // мог сработать уже ПОСЛЕ того, как следующий рендер заменил DOM.
+          if (myGeneration !== branchRailRenderGeneration) return;
+          const allowShrink = widthChangedSinceLastFrame;
           widthChangedSinceLastFrame = false;
-          drawBranchRailNow();
+          drawBranchRailNow(allowShrink);
         });
       });
       branchRailResizeObserver.observe(el);
@@ -1226,6 +1279,11 @@ export class ReleasePanel {
   // 'currentBranch' ниже) и настроенная основная/dev ветка гарантированно попадают в список, даже
   // если их не видно в текущем срезе (иначе выбор мог бы "потерять" ветку, на которой мы стоим).
   let currentBranchValue = '';
+  // "*" — в рабочем каталоге есть изменения без \`git add\` (untracked/modified), "+" — застейджено,
+  // но не закоммичено (см. GitService.workingTreeState). Пересчитывается на сервере при каждом
+  // 'currentBranch' (открытие панели, обновление списка веток, переключение/pull) — коммит можно
+  // сделать прямо в терминале, минуя панель, поэтому это НЕ кэшируется дольше одного сообщения.
+  let currentBranchDirty = { hasStaged: false, hasUnstaged: false };
   // Последний ответ на 'checkReleaseDate' (см. onCheckReleaseDate в session.ts) — реактивно
   // пересчитывает disabled у "Создать релизную ветку" при ЛЮБОМ изменении currentBranchValue, а
   // не только когда сам сервер явно переспрашивает дату: onStartBuilding создаёт/чекаутит ветку и
@@ -1249,7 +1307,19 @@ export class ReleasePanel {
     const names = new Set(currentBranches.map((b) => b.name));
     [currentBranchValue, configMainBranch, configDevBranch].forEach((n) => n && names.add(n));
     const select = document.getElementById('currentBranchSelect');
-    select.innerHTML = [...names].sort().map((n) => \`<option value="\${escapeHtml(n)}"\${n === currentBranchValue ? ' selected' : ''}>\${escapeHtml(n)}</option>\`).join('');
+    // Индикатор относится к рабочему каталогу, а он у нас один — значит, ровно к ТЕКУЩЕЙ ветке,
+    // не к другим опциям селекта (это просто имена для переключения, не отдельные checkout'ы).
+    const dirtySuffix = currentBranchDirty.hasUnstaged || currentBranchDirty.hasStaged
+      ? ' (' + (currentBranchDirty.hasUnstaged ? '*' : '') + (currentBranchDirty.hasStaged ? '+' : '') + ')'
+      : '';
+    select.innerHTML = [...names].sort().map((n) => {
+      const isCurrent = n === currentBranchValue;
+      const label = escapeHtml(n) + (isCurrent ? dirtySuffix : '');
+      return \`<option value="\${escapeHtml(n)}"\${isCurrent ? ' selected' : ''}>\${label}</option>\`;
+    }).join('');
+    select.title = currentBranchDirty.hasUnstaged || currentBranchDirty.hasStaged
+      ? '* — есть незакоммиченные изменения без git add; + — застейджено, но не закоммичено'
+      : '';
   }
   document.getElementById('currentBranchSelect').addEventListener('change', (e) => {
     showError('');
@@ -1658,6 +1728,9 @@ export class ReleasePanel {
   // Текст заголовка одного конфликтующего файла — отдельно от разметки, чтобы не плодить тройной
   // вложенный тернарник прямо в шаблоне ниже.
   function renderConflictFileHeaderText(s) {
+    if (s.analysisPending) {
+      return 'причина ещё считается фоном…';
+    }
     if (!s.sha) {
       return 'файла нет в истории основной ветки (вероятно, его создаёт сам этот коммит)';
     }
@@ -1675,6 +1748,12 @@ export class ReleasePanel {
   // но не переживает смену проекта (сбрасывается в 'resetForNewContext').
   function renderConflictDetails(item) {
     const sources = item.dryRunConflictSources || [];
+    // Быстрый прогон (см. dryRun.ts skipDetailedAnalysis) находит сам конфликт и список файлов
+    // сразу, а причину (blame/taskDivergence/possibleCauses) досчитывает фоном — ConflictSource
+    // в этом промежутке приходит заглушкой (analysisPending: true, см. types.ts), одинаковой для
+    // ВСЕХ файлов одного и того же конфликта сразу (обновляются одним сообщением, см.
+    // 'conflictAnalysisUpdate' ниже) — достаточно проверить первый элемент.
+    const pending = sources.length > 0 && sources[0].analysisPending;
     let details = '';
     if (sources.length === 0) {
       details = item.dryRunConflictFiles && item.dryRunConflictFiles.length
@@ -1684,13 +1763,20 @@ export class ReleasePanel {
       details = '<div class="conflict-details">' + sources.map((s) => {
         const key = item.sha + '|' + s.file;
         const isOpen = expandedConflictSources.has(key);
-        const bodyHtml = renderConflictHunks(s.hunks) + (s.sha ? renderTaskDivergence(s.taskDivergence) : '');
+        const bodyHtml = s.analysisPending
+          ? \`<div class="muted"><span class="inline-loading"></span> Загружаем причину конфликта…</div>\`
+          : renderConflictHunks(s.hunks) + (s.sha ? renderTaskDivergence(s.taskDivergence) : '');
         return \`<div class="conflict-file-block">
           <div class="conflict-file"><span class="conflict-file-toggle" data-key="\${escapeHtml(key)}"><span class="conflict-file-arrow">\${isOpen ? '▾' : '▸'}</span> <b>\${escapeHtml(s.file)}</b></span> — \${renderConflictFileHeaderText(s)}</div>
           <div class="conflict-file-body\${isOpen ? ' open' : ''}" data-key="\${escapeHtml(key)}">\${bodyHtml}</div>
         </div>\`;
       }).join('') + '</div>';
     }
+
+    // possibleCauses/alreadyInMain-подсказка ещё не значит ничего, пока причина сама не досчитана
+    // фоном — иначе "других веток не нашлось" выглядело бы как окончательный вывод, а не как то,
+    // что мы ПОКА не смотрели.
+    if (pending) return details;
 
     let hint = '';
     if (item.alreadyInMain) {
@@ -2411,9 +2497,9 @@ export class ReleasePanel {
             const isConflict = item.dryRunStatus === 'conflict';
             const isConditional = item.dryRunStatus === 'conditional';
             const cls = isConflict ? 'cherry-sha conflict' : isConditional ? 'cherry-sha conditional' : 'cherry-sha';
-            const style = isConflict || isConditional ? \`border-color:\${color}\` : \`background:\${color}\`;
+            const style = \`background:\${color}\`;
             const shaLabel = item.sha.slice(0, 8);
-            const title = escapeHtml(item.branch);
+            const title = \`\${escapeHtml(item.branch)} · \${escapeHtml(item.subject)}\`;
             return item.commitUrl
               ? \`<a class="\${cls}" style="\${style}" href="\${item.commitUrl}" target="_blank" rel="noopener" title="\${title}">\${shaLabel}</a>\`
               : \`<span class="\${cls}" style="\${style}" title="\${title}">\${shaLabel}</span>\`;
@@ -2449,7 +2535,15 @@ export class ReleasePanel {
 
   window.addEventListener('message', (event) => {
     const msg = event.data;
-    if (msg.command === 'resetForNewContext') {
+    if (msg.command === 'refreshReleaseDate') {
+      // Панель — синглтон, переиспользуемый между открытиями (см. ReleasePanel.createOrShow) — сама
+      // веб-страница не перезагружается, поэтому дата, посчитанная один раз при первом создании
+      // панели (todayIso() выше), иначе осталась бы "вчерашней" при повторном открытии на следующий
+      // день. Сервер шлёт актуальную дату при КАЖДОМ показе панели (не только при переключении
+      // проекта — см. 'resetForNewContext' ниже, у него более узкое условие).
+      document.getElementById('releaseDate').value = msg.today;
+      requestReleaseDateCheck();
+    } else if (msg.command === 'resetForNewContext') {
       // Панель переключилась на другой проект (или на "текущий workspace") — см. ReleasePanel.createOrShow.
       // Сама панель (её HTML/скрипт) не перезагружается при переключении, поэтому список веток,
       // хронология и команда cherry-pick с ПРЕЖНЕГО проекта иначе остались бы висеть на экране,
@@ -2503,6 +2597,7 @@ export class ReleasePanel {
       // закончил создание/checkout ветки — сессия шлёт его сразу после этого, ДО postPlan.
       createBranchBusy = false;
       currentBranchValue = msg.current;
+      currentBranchDirty = { hasStaged: !!msg.hasStaged, hasUnstaged: !!msg.hasUnstaged };
       renderCurrentBranchSelect();
       updateCreateBranchBtnState();
       configMainBranch = msg.mainBranch;
@@ -2568,6 +2663,19 @@ export class ReleasePanel {
       for (const [ref, status] of Object.entries(msg.statusByRef)) {
         branchMainStatusOverride.set(ref, status);
       }
+      // "Скрыть уже в main" на сервере решает по БЫСТРОМУ приближённому статусу (по последнему
+      // коммиту — см. sendBranchSlice в session.ts), а не по этому точному, который досчитывается
+      // только сейчас, в фоне, уже ПОСЛЕ того, как срез был отправлен. Из-за этого ветка, которую
+      // быстрый статус ошибочно не считал "полностью в main" (например, patch-id разошёлся из-за
+      // контекста, а subject+date фолбэк тоже не сработал), реально подтверждённая только сейчас
+      // как 'full' — оставалась бы в списке, хотя фильтр включён (реальная жалоба). Досрочно
+      // убираем такие строки на клиенте, не дожидаясь следующего запроса к серверу.
+      if (document.getElementById('hideInMainFilter').checked) {
+        const nowFull = new Set(Object.entries(msg.statusByRef).filter(([, s]) => s === 'full').map(([ref]) => ref));
+        if (nowFull.size > 0 && currentBranches.some((b) => nowFull.has(b.ref))) {
+          currentBranches = currentBranches.filter((b) => !nowFull.has(b.ref));
+        }
+      }
       renderBranches();
     } else if (msg.command === 'branchDiffStats') {
       // Агрегированная сводка +/- и число файлов, тем же фоновым проходом, что и branchMainStatus
@@ -2611,6 +2719,20 @@ export class ReleasePanel {
       renderItems();
       updateBuildButtonsState();
       updateSyncIndicator();
+    } else if (msg.command === 'conflictAnalysisUpdate') {
+      // Фон досчитал причину конфликта (git blame/taskDivergence/possibleCauses) — см.
+      // session.ts runBackgroundConflictAnalysis; сама хронология уже показана раньше, с
+      // заглушками (analysisPending: true). Просто заменяем dryRunConflictSources у нужных
+      // items и перерисовываем — expandedConflictSources/дальнейший рендер сам подхватит,
+      // свернут блок или развёрнут (см. renderConflictDetails/renderItems).
+      if (currentPlan) {
+        const byShaMap = new Map((msg.updates || []).map((u) => [u.sha, u.conflictSources]));
+        currentPlan.items.forEach((item) => {
+          const sources = byShaMap.get(item.sha);
+          if (sources) item.dryRunConflictSources = sources;
+        });
+        renderItems();
+      }
     } else if (msg.command === 'releaseBranchPatternCount') {
       releaseBranchPatternCount = msg.count;
       // Число входит прямо в текст окна поиска забытых веток (см. renderStaleBranchesControls) —

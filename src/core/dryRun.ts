@@ -27,8 +27,23 @@ export interface DryRunOutcome {
  *
  * devRef нужен только для более точной диагностики самого конфликта (см.
  * GitService.analyzeConflictSource/findTaskDivergence) — на исход dry-run (ok/conflict/empty) не влияет.
+ *
+ * opts.skipDetailedAnalysis — пропускает GitService.analyzeConflictSource (git blame + поиск
+ * задачи на dev + всё остальное, что реально небыстро, особенно когда конфликтов теперь несколько
+ * за прогон, см. комментарий выше про blockedFiles) — конфликт всё равно находится ТОЧНО (реальным
+ * cherry-pick, не эвристикой), просто без объяснения причины. Источник в этом случае — заглушка
+ * (`analysisPending: true`, пустые hunks/sha/taskDivergence). Так вызывающий код (см.
+ * runDryRunOnCurrentPlan в session.ts) может сначала быстро показать саму хронологию, а детали
+ * конфликта досчитать вторым, более медленным фоновым прогоном, не задерживая первый.
  */
-export async function performDryRun(git: GitService, baseRef: string, devRef: string, items: PlanItem[]): Promise<DryRunOutcome> {
+export async function performDryRun(
+  git: GitService,
+  baseRef: string,
+  devRef: string,
+  items: PlanItem[],
+  opts?: { skipDetailedAnalysis?: boolean }
+): Promise<DryRunOutcome> {
+  const skipDetailedAnalysis = opts?.skipDetailedAnalysis ?? false;
   const included = items.filter((i) => i.included && !i.applied);
   const tmpDir = path.join(os.tmpdir(), `qvarh-release-dryrun-${crypto.randomUUID()}`);
 
@@ -103,22 +118,36 @@ export async function performDryRun(git: GitService, baseRef: string, devRef: st
           // Анализируем файл ДО abort — файл в worktree ещё содержит маркеры конфликта, по которым
           // GitService.analyzeConflictSource находит ТОЧНЫЕ конфликтующие строки (а не "последний
           // коммит, менявший файл вообще") и, если получится, коммит с той же задачей на dev.
-          const conflictSources: ConflictSource[] = await Promise.all(
-            conflictFiles.map(async (file): Promise<ConflictSource> => {
-              const analysis = await worktreeGit.analyzeConflictSource(tmpDir, file, baseRef, devRef, item.sha);
-              return {
+          const conflictSources: ConflictSource[] = skipDetailedAnalysis
+            ? conflictFiles.map((file): ConflictSource => ({
                 file,
-                sha: analysis.sha,
-                subject: analysis.subject,
-                authorName: analysis.authorName,
-                authorDate: analysis.authorDate,
-                commitUrl: null, // проставляется в session.ts (buildLinks) — ядро не знает о конфиге ссылок
-                hunks: analysis.hunks,
-                taskDivergence: analysis.taskDivergence ? { ...analysis.taskDivergence, otherCommitUrl: null } : null, // otherCommitUrl — тоже session.ts
-                possibleCauses: [], // заполняется в session.ts (findConflictCauses) — там же есть конфиг/список веток
-              };
-            })
-          );
+                sha: null,
+                subject: null,
+                authorName: null,
+                authorDate: null,
+                commitUrl: null,
+                hunks: [],
+                taskDivergence: null,
+                possibleCauses: [],
+                analysisPending: true,
+              }))
+            : await Promise.all(
+                conflictFiles.map(async (file): Promise<ConflictSource> => {
+                  const analysis = await worktreeGit.analyzeConflictSource(tmpDir, file, baseRef, devRef, item.sha);
+                  return {
+                    file,
+                    sha: analysis.sha,
+                    subject: analysis.subject,
+                    authorName: analysis.authorName,
+                    authorDate: analysis.authorDate,
+                    commitUrl: null, // проставляется в session.ts (buildLinks) — ядро не знает о конфиге ссылок
+                    hunks: analysis.hunks,
+                    taskDivergence: analysis.taskDivergence ? { ...analysis.taskDivergence, otherCommitUrl: null } : null, // otherCommitUrl — тоже session.ts
+                    possibleCauses: [], // заполняется в session.ts (findConflictCauses) — там же есть конфиг/список веток
+                    analysisPending: false,
+                  };
+                })
+              );
           results.push({ sha: item.sha, status: 'conflict', conflictFiles, conflictSources });
           await worktreeGit.cherryPickAbort();
           // Весь диф коммита (не только сами конфликтующие файлы) — после abort ни один из его

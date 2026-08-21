@@ -319,6 +319,26 @@ export class GitService {
     }
   }
 
+  /**
+   * Незакоммиченные изменения в рабочем каталоге ТЕКУЩЕЙ ветки — отдельно "застейджено" от "нет"
+   * (см. releasePanel.ts, индикаторы "*"/"+" рядом с текущей веткой в селекте: "*" — есть изменения
+   * без `git add`, "+" — застейджено, но не закоммичено). Один и тот же файл может попасть в обе
+   * категории сразу (частично застейджен).
+   *
+   * Читаем X/Y-коды `git status --porcelain` напрямую из `status.files[].index`/`working_dir`
+   * (а не агрегированные списки simple-git типа `modified`/`created` — те объединяют индекс и
+   * рабочий каталог, не различая "застейджено" от "нет"). `index === '?'` — файл не отслеживается
+   * (untracked, `??`) — это НЕ застейджено, но точно "есть изменения без add", поэтому считается
+   * только в hasUnstaged.
+   */
+  async workingTreeState(): Promise<{ hasStaged: boolean; hasUnstaged: boolean }> {
+    const status = await this.git.status();
+    return {
+      hasStaged: status.files.some((f) => f.index !== ' ' && f.index !== '?'),
+      hasUnstaged: status.files.some((f) => f.working_dir !== ' '),
+    };
+  }
+
   async resolveRef(ref: string): Promise<string> {
     return (await this.git.revparse([ref])).trim();
   }

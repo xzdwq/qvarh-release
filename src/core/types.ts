@@ -225,6 +225,15 @@ export interface ConflictSource {
    * конфликт, вероятно, придётся разрешать вручную.
    */
   possibleCauses: ConflictCause[];
+  /**
+   * true — это заглушка: сам конфликт уже найден и подтверждён реальным cherry-pick (не гадание),
+   * но объяснение причины (git blame, taskDivergence, possibleCauses) ещё считается фоном (см.
+   * performDryRun с skipDetailedAnalysis в dryRun.ts и runBackgroundConflictAnalysis в session.ts) —
+   * сделано так, чтобы сама хронология построилась быстро, не дожидаясь этого небыстрого анализа.
+   * sha/subject/authorName/authorDate/hunks/taskDivergence/possibleCauses в этом состоянии всегда
+   * пустые/null — UI должен показать лоадер вместо них, а не пытаться их отрендерить.
+   */
+  analysisPending: boolean;
 }
 
 export interface PlanItem extends CommitInfo {

@@ -27,7 +27,7 @@ import {
   findStaleUnmergedBranches,
   getBranchCommits,
 } from './core/planner';
-import { BranchRef, MergeEventInfo, PlanItem, ReleaseConfig, ReleasePlan } from './core/types';
+import { BranchRef, ConflictSource, MergeEventInfo, PlanItem, ReleaseConfig, ReleasePlan } from './core/types';
 import { GitService, MergeEventDetails, mainSubjectDateKey } from './git/gitService';
 import { PanelContext, ReleasePanel, ReleasePanelHost } from './ui/releasePanel';
 
@@ -532,8 +532,13 @@ export class ReleaseSession implements ReleasePanelHost {
 
   private async postCurrentBranch(): Promise<void> {
     const current = await this.git.currentBranch();
+    // Индикаторы "*"/"+" у текущей ветки (см. releasePanel.ts) — считаем заново при КАЖДОМ вызове
+    // (открытие панели, обновление списка веток, переключение/pull ветки), а не кэшируем: можно
+    // закоммитить/застейджить прямо в терминале, минуя панель, и старый индикатор молча разошёлся
+    // бы с реальным состоянием репозитория.
+    const dirtyState = await this.git.workingTreeState();
     if (!this.isActive()) return;
-    this.panel.postCurrentBranch(current, this.config.mainBranch, this.config.devBranch, this.config.staleBranchesLookbackReleases);
+    this.panel.postCurrentBranch(current, this.config.mainBranch, this.config.devBranch, this.config.staleBranchesLookbackReleases, dirtyState);
   }
 
   private selectedBranchRefs(): BranchRef[] {
@@ -677,6 +682,7 @@ export class ReleaseSession implements ReleasePanelHost {
     this.panel.postPlan(this.plan);
     this.panel.postStaleBranchesLoading();
     void this.runFindStaleBranches(generation, mainRef);
+    void this.runBackgroundConflictAnalysis(generation);
 
     const warnings: string[] = [];
     if (skipped.length > 0) {
@@ -776,6 +782,7 @@ export class ReleaseSession implements ReleasePanelHost {
       }
       return;
     }
+    let mainRef: string | null = null;
     try {
       // Персистентный план — застывший снимок с прошлого раза; dev могла продолжить жить и
       // смержить что-то уже ПОСЛЕ того, как план был сохранён (или план вообще сохранён более
@@ -783,8 +790,9 @@ export class ReleaseSession implements ReleasePanelHost {
       // нет). Пересчитываем его заново тем же дешёвым, уже закэшированным запросом, а не
       // показываем как есть — иначе дорожка веток в хронологии может ошибочно показывать давно
       // влитую ветку как всё ещё не влитую.
-      const { mainRef, mergeEvents } = await this.getRefsCache();
-      this.plan.mergeEventsByBranch = this.applyMergeEvents(this.plan.items, mergeEvents);
+      const refs = await this.getRefsCache();
+      mainRef = refs.mainRef;
+      this.plan.mergeEventsByBranch = this.applyMergeEvents(this.plan.items, refs.mergeEvents);
       await this.syncAppliedFromReleaseBranch();
       await this.syncAlreadyInMainFromCurrentState(mainRef);
       // dryRunStatus/dryRunConflictFiles в снимке — тоже застывшие, с момента ПОСЛЕДНЕЙ сборки
@@ -798,6 +806,23 @@ export class ReleaseSession implements ReleasePanelHost {
     }
     this.persist();
     if (this.isActive()) this.panel.postPlan(this.plan);
+    // Тот же счётчик, что и у rebuildPlan (см. planGeneration) — здесь план не пересобирается с
+    // нуля, поэтому используем его просто как метку "актуально ли ещё это конкретное срабатывание",
+    // а не как признак смены выбора веток.
+    this.planGeneration += 1;
+    void this.runBackgroundConflictAnalysis(this.planGeneration);
+    // Раньше этот путь (восстановление уже готового, персистентного плана — start()/resume() на
+    // релизной ветке, в т.ч. повторный запуск после публикации) вообще не запускал скан забытых
+    // веток — реальная жалоба: спиннер "Проверяем, нет ли забытых..." оставался висеть НАВСЕГДА,
+    // потому что панель — синглтон (см. ReleasePanel.createOrShow), а каждый повторный запуск
+    // команды создаёт НОВУЮ ReleaseSession с host, отличным от того, что был у сессии, которая
+    // запустила предыдущий скан (см. isActive()/ReleasePanel.isCurrentHost) — старый скан молча
+    // отбрасывал свой результат по этой проверке, а новая сессия свой собственный скан не
+    // запускала вовсе, поэтому клиент так и оставался с последним сообщением "идёт проверка".
+    if (mainRef) {
+      this.panel.postStaleBranchesLoading();
+      void this.runFindStaleBranches(this.planGeneration, mainRef);
+    }
   }
 
   /**
@@ -1082,6 +1107,7 @@ export class ReleaseSession implements ReleasePanelHost {
    */
   async onRefreshBranches(): Promise<void> {
     if (!this.ready) return;
+    await this.postCurrentBranch();
     await this.refreshBranches();
   }
 
@@ -1301,16 +1327,14 @@ export class ReleaseSession implements ReleasePanelHost {
    * после построения/изменения хронологии (см. комментарий там), поэтому здесь только мутирует
    * this.plan.items — persist/postPlan и обработку ошибок делает вызывающий код.
    *
-   * Для КАЖДОГО настоящего конфликта (dryRunStatus === 'conflict', не уже-в-main коммита — для него
-   * достаточно подсказки "можно исключить из релиза", основанной на существующем item.alreadyInMain)
-   * ищем вероятную причину — см. findConflictCauses: коммиты с других, ещё не выбранных веток, которые
-   * тоже трогают этот файл и ещё не в main. performDryRun больше не останавливается на первом же
-   * конфликте (см. dryRun.ts) — он продолжает через ВЕСЬ список, пропуская (без реального
-   * cherry-pick, статус 'conditional') коммиты, которые трогают файлы уже найденного, но пока не
-   * разрешённого конфликта: их итог зависит от того, как вы его разрешите, и гадать за пользователя
-   * нельзя. Поэтому конфликтов теперь может быть несколько за один прогон — дёшево (по одному
-   * git-вызову на конфликтующий файл), поэтому можно позволить себе для каждого, а не только для
-   * первого найденного.
+   * skipDetailedAnalysis: true (см. dryRun.ts) — сам конфликт (и статус ok/conflict/conditional/
+   * empty) находится точно, реальным cherry-pick, но БЕЗ объяснения причины (git blame/
+   * taskDivergence/possibleCauses — небыстрая часть, особенно когда конфликтов за прогон теперь
+   * может быть несколько, не только первый, см. dryRun.ts про blockedFiles). Эта часть — то, что
+   * реально нужно ПОКАЗАТЬ пользователю быстро (хронология целиком, включая сам факт "тут
+   * конфликт"), поэтому детали объяснения досчитываются отдельным, более медленным фоновым прогоном
+   * (см. runBackgroundConflictAnalysis) — вызывающий код (rebuildPlan/finishApplyingPlan) запускает
+   * его сам, уже после того, как persist/postPlan этого, быстрого, результата отработали.
    */
   private async runDryRunOnCurrentPlan(): Promise<void> {
     if (!this.plan || this.plan.items.length === 0) return;
@@ -1322,7 +1346,7 @@ export class ReleaseSession implements ReleasePanelHost {
     const baseRef =
       this.releaseBranch && (await this.git.branchExists(this.releaseBranch)) ? this.releaseBranch : this.plan.mainBranch;
     const devRef = await this.resolveDevRef();
-    const outcome = await performDryRun(this.git, baseRef, devRef, this.plan.items);
+    const outcome = await performDryRun(this.git, baseRef, devRef, this.plan.items, { skipDetailedAnalysis: true });
 
     const bySha = new Map(outcome.results.map((r) => [r.sha, r] as const));
     for (const item of this.plan.items) {
@@ -1330,36 +1354,77 @@ export class ReleaseSession implements ReleasePanelHost {
       if (result) {
         item.dryRunStatus = result.status;
         item.dryRunConflictFiles = result.conflictFiles;
-        item.dryRunConflictSources = result.conflictSources.map((source) => ({
-          ...source,
-          commitUrl: source.sha ? this.buildLinks('', source.subject ?? '', source.sha, null).commitUrl : null,
-          taskDivergence: source.taskDivergence
-            ? {
-                ...source.taskDivergence,
-                otherCommitUrl: this.buildLinks('', source.taskDivergence.otherSubject, source.taskDivergence.otherSha, null).commitUrl,
-              }
-            : null,
-        }));
+        item.dryRunConflictSources = result.conflictSources;
       } else if (item.included) {
         item.dryRunStatus = 'untested';
       }
     }
+  }
 
-    const excludeShas = new Set(this.plan.items.map((i) => i.sha));
-    for (const conflictItem of this.plan.items) {
-      if (conflictItem.dryRunStatus !== 'conflict' || conflictItem.alreadyInMain) continue;
-      for (const source of conflictItem.dryRunConflictSources) {
-        const causes = await findConflictCauses(
-          this.git,
-          this.plan.mainBranch,
-          source.file,
-          excludeShas,
-          (name) => this.isIgnorableCandidateName(name),
-          this.config.remoteName
-        );
-        source.possibleCauses = causes.map((c) => ({ ...c, ...this.buildLinks(c.branch, c.subject, c.sha, null) }));
-      }
+  /**
+   * Медленная половина dry-run — объяснение причины КАЖДОГО настоящего конфликта (git blame,
+   * taskDivergence, possibleCauses — см. GitService.analyzeConflictSource/findConflictCauses),
+   * пропущенная в быстром прогоне (runDryRunOnCurrentPlan, skipDetailedAnalysis: true) специально
+   * ради того, чтобы хронология показалась быстро. Прогоняет ПОЛНЫЙ performDryRun ещё раз (тот же
+   * baseRef/devRef/items) — второй проход cherry-pick стоит дополнительного времени, но это фон, не
+   * блокирующий показ хронологии, а единственный способ повторно оказаться ровно в том же
+   * конфликтном состоянии (см. docstring analyzeConflictSource в gitService.ts — контекст вокруг
+   * конфликта зависит от РЕАЛЬНО применённых до него коммитов, это не воссоздать без самого прогона).
+   *
+   * generation — тот же счётчик, что и у остального асинхронного кода вокруг плана (см.
+   * planGeneration/runFindStaleBranches) — если план успел перестроиться заново, пока этот фон
+   * работал, результат уже не относится к актуальному плану и молча отбрасывается.
+   */
+  private async runBackgroundConflictAnalysis(generation: number): Promise<void> {
+    if (!this.plan || this.plan.items.length === 0) return;
+    let outcome;
+    try {
+      const baseRef =
+        this.releaseBranch && (await this.git.branchExists(this.releaseBranch)) ? this.releaseBranch : this.plan.mainBranch;
+      const devRef = await this.resolveDevRef();
+      outcome = await performDryRun(this.git, baseRef, devRef, this.plan.items);
+    } catch {
+      // Мягкий отказ — хронология уже показана по быстрому прогону, просто без объяснения причины.
+      return;
     }
+    if (generation !== this.planGeneration || !this.plan) return;
+
+    const bySha = new Map(outcome.results.map((r) => [r.sha, r] as const));
+    const excludeShas = new Set(this.plan.items.map((i) => i.sha));
+    const updates: Array<{ sha: string; conflictSources: ConflictSource[] }> = [];
+    for (const item of this.plan.items) {
+      const result = bySha.get(item.sha);
+      if (!result || result.status !== 'conflict') continue;
+      const sources = result.conflictSources.map((source) => ({
+        ...source,
+        commitUrl: source.sha ? this.buildLinks('', source.subject ?? '', source.sha, null).commitUrl : null,
+        taskDivergence: source.taskDivergence
+          ? {
+              ...source.taskDivergence,
+              otherCommitUrl: this.buildLinks('', source.taskDivergence.otherSubject, source.taskDivergence.otherSha, null).commitUrl,
+            }
+          : null,
+      }));
+      if (!item.alreadyInMain) {
+        for (const source of sources) {
+          const causes = await findConflictCauses(
+            this.git,
+            this.plan.mainBranch,
+            source.file,
+            excludeShas,
+            (name) => this.isIgnorableCandidateName(name),
+            this.config.remoteName
+          );
+          source.possibleCauses = causes.map((c) => ({ ...c, ...this.buildLinks(c.branch, c.subject, c.sha, null) }));
+        }
+      }
+      if (generation !== this.planGeneration || !this.plan) return; // могло устареть за время findConflictCauses выше
+      item.dryRunConflictSources = sources; // сохраняем и в сам план — переживает persist/следующий showPlan
+      updates.push({ sha: item.sha, conflictSources: sources });
+    }
+    if (updates.length === 0) return;
+    this.persist();
+    if (this.isActive()) this.panel.postConflictAnalysisUpdate(updates);
   }
 
   /** Реально создаёт (или переиспользует) релизную ветку от основной — только на этом шаге нужна дата. */
